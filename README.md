@@ -1,5 +1,5 @@
 diff --git a/docs/01_system_overview.md b/docs/01_system_overview.md
-index 1f4b653..b01a760 100644
+index 1f4b653..ed3f819 100644
 --- a/docs/01_system_overview.md
 +++ b/docs/01_system_overview.md
 @@ -32,6 +32,8 @@ The NUML Management System is a full-stack web application designed to centraliz
@@ -17,7 +17,7 @@ index 1f4b653..b01a760 100644
  - JWT-based stateless authentication
 -- Role-Based Access Control (RBAC) — three roles: Student, Instructor, Admin
 +- Role-Based Access Control (RBAC) — six system roles: Main Admin, Instructor, HOD, Department Staff, Accounts Staff and Student. Roles are separate from department assignments (HOD, instructor and staff assignments) and from position titles such as Receptionist, which are data, not roles. Permissions come from a central catalogue; department staff receive theirs per assignment.
-+- Main Admin has global authority; HODs and delegated department staff act only within the departments their own assignments authorize, and have no global account or system-role management.
++- Main Admin has global authority; HODs and delegated department staff act only within the departments their own assignments authorize, and have no global account or system-role management. Assigning a system role to a user (global, Main Admin) is a different thing from assigning that user responsibility for a particular department, such as an HOD assignment (department-scoped); see §4.4.
  - Secure password hashing (Argon2id)
  - Access token + Refresh token pattern
  - Route-level protection on both frontend and backend
@@ -29,20 +29,46 @@ index 1f4b653..b01a760 100644
  
  
  
-@@ -72,8 +76,10 @@ The NUML Management System is a full-stack web application designed to centraliz
+@@ -72,15 +76,29 @@ The NUML Management System is a full-stack web application designed to centraliz
  
  ### 4.4 Admin Panel
  
 -- Create/update/deactivate user accounts (students, instructors, sub-admins)
 -- Assign roles and permissions
-+- Global account and system-role management — **Main Admin only**: global account activation and deactivation, institutional name and login-email changes, and system-role assignment (for example appointing an HOD to departments). Role grants come from the central permission catalogue. Department staff accounts are created by HODs inside their own departments (current implementation); that is departmental delegation, not global account management.
-+- Student registration — Main Admin, HODs and delegated department staff within their authorized departments *(approved Phase 4 policy, not yet implemented)*.
-+- Only Main Admin can globally activate or deactivate accounts. HODs cannot globally deactivate accounts or change user names, login emails, system roles or global account status.
+-- Create semesters, departments, and courses
+-- Enroll students into courses
+-- Generate and manage fee challans
+-- Split challans into sub-challans (installments)
+-- Track payment status
+-- View real-time analytics dashboard
+-- Generate reports (attendance, marks, fees)
++*The Admin Panel is the Main Admin's global console. Some capabilities below are
++delegated, wholly or in part, to HODs, department staff or accounts staff inside their
++authorized scope, so each bullet names the responsible authority. Items marked
++"planned" are not built yet; where the plan has not yet decided who is responsible, the
++bullet says so rather than guessing.*
++
++**Accounts, system roles and departmental responsibility**
++
++- Global account management — **Main Admin only**: global account activation and deactivation, and institutional name and login-email changes. Only Main Admin can globally activate or deactivate accounts. HODs cannot globally deactivate accounts or change user names, login emails, system roles or global account status.
++- **System-role assignment** — **Main Admin only (global)**: assigning a system role, such as the HOD role, to a user. The roles are the six fixed system roles in §4.1, and what each role may do comes from the central permission catalogue. HODs cannot create or assign system roles.
++- **Departmental responsibility assignment** — a separate, department-scoped assignment that makes a user who holds the matching role responsible for one or more particular departments (for example making an HOD responsible for Computer Science and for Software Engineering). One person can hold several, and revoking one leaves the others untouched. *Current implementation:* only Main Admin makes HOD assignments, there is at most one HOD per department, and the user must be an instructor. Authority inside a department needs both the HOD role and an assignment to that department. The current HOD-assignment operation records the departmental assignment and, if the user does not yet hold the HOD role, grants the role in the same step; the role is removed only when the person's last HOD assignment is revoked.
++- Departmental staff — HODs create departmental staff accounts and manage staff assignments inside their own departments *(current implementation)*; that is departmental delegation, not global account management.
 +- Departmental permission delegation follows the central permission catalogue and the department-scoped authorization rules. An HOD delegates only permissions that are on the approved delegation allow-list and that the HOD holds in that department, and cannot create system roles. Delegated staff perform only the operations explicitly delegated to them in the authorized department; they cannot manage accounts or system roles globally.
- - Create semesters, departments, and courses
- - Enroll students into courses
- - Generate and manage fee challans
-@@ -96,7 +102,7 @@ The NUML Management System is a full-stack web application designed to centraliz
++- Student registration — Main Admin, HODs and delegated department staff within their authorized departments *(approved Phase 4 policy, not yet implemented)*.
++
++**Academic structure and operations**
++
++- Departments, programs and academic terms (the semesters of this overview) — create, edit, activate and deactivate: **Main Admin only** *(current implementation, Phase 3)*. Sections: Main Admin, and HODs within their own authorized departments *(current implementation, Phase 3)*.
++- Courses — *planned (Phase 7)*. Whether Main Admin, HODs or authorized department staff create and manage courses within their scope is decided when the course module is designed.
++- Course enrollment — *planned (Phase 8)*. Students enroll themselves while an enrollment window is open, and HODs or authorized department staff open and close enrollment within their departments; whether authorized administrators also enroll students administratively (FR-06-1) is decided in that phase.
++- Fee challans, split challans and payment status — **Accounts staff** *(planned, Phases 16–18)*. HODs have view-only access to fee status for students in their authorized departments. Any further Main Admin role in fees is decided with the fee module.
++- Analytics dashboard — *planned (Phase 21)*; who sees which scope is decided with that phase (the requirements only fix that dashboards can be filtered by academic term and department).
++- Reports (attendance, marks, fees) — *planned (Phase 20)*: Main Admin sees global reports, HODs only for the departments they manage, and instructors for their assigned classes.
+ 
+ 
+ 
+@@ -96,7 +114,7 @@ The NUML Management System is a full-stack web application designed to centraliz
  
  ### 4.6 Notifications
  
@@ -415,7 +441,7 @@ index ce2b416..854ef02 100644
  - Attendance Shortage Alert
  - Fee Challan Upload
 diff --git a/docs/implementation-plan.md b/docs/implementation-plan.md
-index 4c66a70..6101b04 100644
+index 4c66a70..dbf9eff 100644
 --- a/docs/implementation-plan.md
 +++ b/docs/implementation-plan.md
 @@ -4,7 +4,8 @@
@@ -576,7 +602,27 @@ index 4c66a70..6101b04 100644
  ## 5.5 Department Scope
  
  Never assume:
-@@ -529,7 +543,10 @@ summary:
+@@ -483,6 +497,19 @@ Main Admin should:
+ 
+ A teacher remains an instructor while also becoming an HOD.
+ 
++**Terminology.** Two different things are involved, and they are not the same operation:
++(1) the **HOD system role**, a global role that a user holds (assigning system roles is
++Main Admin authority), and (2) a **departmental responsibility assignment**, an HOD
++assignment that makes that user responsible for one particular department (it is
++department-scoped, each department has at most one HOD, one person may be HOD of several
++departments, and revoking one leaves the others untouched). Authority inside a department
++needs both the role and an assignment to that department, and the permission and the
++department are checked on the same role assignment. *Current implementation:* only Main
++Admin performs HOD assignments, the user must already be an instructor, and the assignment
++operation records the departmental assignment and, if the user does not yet hold the HOD
++role, grants it in the same step; the HOD role is removed only when the person's last HOD
++assignment is revoked.
++
+ ## 5.7 Department Staff Creation
+ 
+ HOD should be able to:
+@@ -529,7 +556,10 @@ summary:
  -   **User directory:** department-scoped search and profile reads. `user.update`
      stays **Main Admin only**; HODs cannot edit names, email, status or roles.
      Changing a login email notifies the old address, revokes sessions and marks
@@ -588,7 +634,7 @@ index 4c66a70..6101b04 100644
  -   The **permission catalogue** in 5.4 is fully registered in
      `app/core/permissions.py`. Registering a code grants nothing; codes for
      unbuilt modules are held by Main Admin only. Three names were aligned with
-@@ -614,6 +631,14 @@ Deactivating a staff account must not delete historical audit records.
+@@ -614,6 +644,14 @@ Deactivating a staff account must not delete historical audit records.
  
  Reusable audit service that future modules can call.
  
@@ -603,7 +649,7 @@ index 4c66a70..6101b04 100644
  ------------------------------------------------------------------------
  
  # 7. Phase 3 --- Academic Organization Foundation
-@@ -657,9 +682,9 @@ Support:
+@@ -657,9 +695,9 @@ Support:
  
  -   Create section
  -   Rename section
@@ -615,7 +661,7 @@ index 4c66a70..6101b04 100644
  
  A student can later be moved between academic semester/section
  placements without deleting historical academic records.
-@@ -691,10 +716,15 @@ BSCS 3/A
+@@ -691,10 +729,15 @@ BSCS 3/A
  
  The department controls such movement.
  
@@ -633,7 +679,7 @@ index 4c66a70..6101b04 100644
  
  ## Phase 3 amendments (as built)
  
-@@ -714,11 +744,11 @@ The authoritative description is
+@@ -714,11 +757,11 @@ The authoritative description is
      staff receive no new permission.
  -   Deactivation is blocked by active dependents (never cascaded); nothing is
      hard-deleted. Department names are unique case-insensitively.
@@ -650,7 +696,7 @@ index 4c66a70..6101b04 100644
  
  ------------------------------------------------------------------------
  
-@@ -746,7 +776,9 @@ Student information includes the agreed registration fields:
+@@ -746,7 +789,9 @@ Student information includes the agreed registration fields:
  
  -   First name and last name (required)
  -   Email (required; it is the login identity)
@@ -661,7 +707,7 @@ index 4c66a70..6101b04 100644
  -   Program (required)
  -   Semester level (required; the student's level in the degree, for example
      1st to 8th. It is **not** an academic term)
-@@ -762,10 +794,45 @@ Not part of manual registration in Phase 4:
+@@ -762,10 +807,45 @@ Not part of manual registration in Phase 4:
      (current placement, then program, then department).
  -   **CNIC** is excluded. The business requirement for storing it has not been
      established, so there is no column, field or validation for it until it is
@@ -708,7 +754,7 @@ index 4c66a70..6101b04 100644
  ### Initial Credentials
  
  > **Superseded by the Phase 1 authentication decisions.** The original text of
-@@ -797,7 +864,8 @@ Students can later change their password.
+@@ -797,7 +877,8 @@ Students can later change their password.
  
  Validate at minimum:
  
@@ -718,7 +764,7 @@ index 4c66a70..6101b04 100644
  -   Email uniqueness (an email already used by any account is refused; an
      existing account is never reused)
  -   Required fields
-@@ -817,8 +885,9 @@ Validate at minimum:
+@@ -817,8 +898,9 @@ Validate at minimum:
  
  User account creation, student profile creation, the initial placement and the
  audit record occur in **one database transaction** so partial student accounts
@@ -730,7 +776,7 @@ index 4c66a70..6101b04 100644
  
  ### After Successful Registration
  
-@@ -858,14 +927,33 @@ The authoritative design is
+@@ -858,14 +940,33 @@ The authoritative design is
      are Main Admin only. Main Admin also gets a global student search.
  -   **Movement, promotion and freeze are not part of this phase.** Only two
      Main Admin-only corrections of data-entry mistakes exist: the initial
@@ -768,7 +814,7 @@ index 4c66a70..6101b04 100644
  
  ------------------------------------------------------------------------
  
-@@ -873,7 +961,9 @@ The authoritative design is
+@@ -873,7 +974,9 @@ The authoritative design is
  
  ## Objective
  
@@ -779,7 +825,7 @@ index 4c66a70..6101b04 100644
  
  ## Workflow
  
-@@ -946,6 +1036,14 @@ should be reused by bulk registration. Phase 4 builds that service with plain
+@@ -946,6 +1049,14 @@ should be reused by bulk registration. Phase 4 builds that service with plain
  inputs and one transaction per student, so Phase 5 can call it once per valid
  row; the onboarding emails are queued after each successful row, never before.
  
@@ -794,7 +840,7 @@ index 4c66a70..6101b04 100644
  ## Deliverable
  
  Production-style student registration module with manual and bulk
-@@ -953,6 +1051,44 @@ workflows.
+@@ -953,6 +1064,44 @@ workflows.
  
  ------------------------------------------------------------------------
  
@@ -839,7 +885,7 @@ index 4c66a70..6101b04 100644
  # 10. Phase 6 --- Instructor Management and Teaching Assignments
  
  ## Objective
-@@ -984,6 +1120,12 @@ Instructor
+@@ -984,6 +1133,12 @@ Instructor
  
  The same course may have different instructors in different sections.
  
@@ -852,7 +898,7 @@ index 4c66a70..6101b04 100644
  ------------------------------------------------------------------------
  
  # 11. Phase 7 --- Course Management and Prerequisites
-@@ -1301,6 +1443,11 @@ Accounts staff:
+@@ -1301,6 +1456,11 @@ Accounts staff:
  Store actual FYP challan files in `uploads/` and file metadata in
  PostgreSQL.
  
@@ -864,7 +910,7 @@ index 4c66a70..6101b04 100644
  ## Student
  
  Student can:
-@@ -1414,6 +1561,10 @@ Background Queue
+@@ -1414,6 +1574,10 @@ Background Queue
  Google SMTP
  ```
  
@@ -875,8 +921,12 @@ index 4c66a70..6101b04 100644
  In-app notifications initially use polling.
  
  Possible future upgrade:
-@@ -1569,7 +1720,7 @@ Example:
- Admin assigns HOD
+@@ -1566,10 +1730,10 @@ Test complete workflows rather than isolated endpoints.
+ Example:
+ 
+ ``` text
+-Admin assigns HOD
++Admin makes an instructor HOD of a department (HOD role + departmental assignment)
  → HOD creates receptionist
  → Receptionist logs in
 -→ Receptionist imports students
@@ -884,7 +934,7 @@ index 4c66a70..6101b04 100644
  → HOD views receptionist activity
  ```
  
-@@ -1663,7 +1814,8 @@ Complete:
+@@ -1663,9 +1827,11 @@ Complete:
  -   Department staff accounts
  -   Manual student registration
  -   Bulk student registration
@@ -892,9 +942,23 @@ index 4c66a70..6101b04 100644
 +-   Onboarding emails (staff: temporary password; students: instructions only, no
 +    password)
  
- **Result:** Admin can appoint HOD → HOD can create receptionist →
+-**Result:** Admin can appoint HOD → HOD can create receptionist →
++**Result:** Admin can make an instructor HOD of a department (role plus departmental
++assignment) → HOD can create receptionist →
  receptionist can register students → HOD can audit actions.
-@@ -1751,21 +1903,21 @@ HOD grants:
+ 
+ ## Milestone 3 --- Academic Setup
+@@ -1741,7 +1907,8 @@ Main Admin
+     ↓
+ Creates/has Instructor
+     ↓
+-Assigns Instructor as HOD of CS + SE
++Gives the Instructor the HOD role and assigns
++    HOD responsibility for CS + SE (two departmental assignments)
+     ↓
+ HOD logs in
+     ↓
+@@ -1751,21 +1918,21 @@ HOD grants:
      student.view
      student.create
      student.update
@@ -919,7 +983,7 @@ index 4c66a70..6101b04 100644
      (email login; onboarding via the forgot-password email-OTP flow, no
      password emailed, never CNIC-based; see Phase 4)
      ↓
-@@ -1774,6 +1926,13 @@ HOD opens Audit Logs
+@@ -1774,6 +1941,13 @@ HOD opens Audit Logs
  HOD sees actions performed by Receptionist
  ```
  
@@ -933,7 +997,7 @@ index 4c66a70..6101b04 100644
  If this workflow works correctly, many important architectural concerns
  have already been proven:
  
-@@ -1924,5 +2083,11 @@ Optional Future Data Store
+@@ -1924,5 +2098,11 @@ Optional Future Data Store
  └── MongoDB only if a justified document/event workload appears
  ```
  
@@ -946,7 +1010,7 @@ index 4c66a70..6101b04 100644
  This stack should remain the baseline unless an implementation
  requirement demonstrates a concrete need to change it.
 diff --git a/docs/phase1-identity-and-security.md b/docs/phase1-identity-and-security.md
-index 0f16f6d..f9b63f5 100644
+index 0f16f6d..27a38f2 100644
 --- a/docs/phase1-identity-and-security.md
 +++ b/docs/phase1-identity-and-security.md
 @@ -19,7 +19,9 @@ Production database roles are in [database-roles.md](database-roles.md).
@@ -980,7 +1044,26 @@ index 0f16f6d..f9b63f5 100644
  
  ### Concurrent refresh (several tabs at once)
  
-@@ -237,7 +241,7 @@ the allow-list. Removing a permission is always allowed.
+@@ -173,6 +177,18 @@ never combined with another role's department.
+ Instructors, HODs and department staff are distinct categories. Staff can never
+ acquire instructor/HOD authority through delegation.
+ 
++**HOD role versus HOD assignment.** These are two different records with different
++meanings. The **HOD system role** (`user_roles`) is global and is Main Admin authority.
++An **HOD assignment** (`hod_assignments`) makes the user responsible for one particular
++department: it is department-scoped, each department has at most one, a person may hold
++several, and revoking one leaves the others. Authority in a department needs both, and the
++permission and the department are checked on the same role assignment. *As built:* only
++Main Admin performs HOD assignments (`department.hod.assign`, `PUT`/`DELETE
++/departments/{id}/hod`); the target must be an instructor; the assignment step records the
++departmental assignment and, if the user does not yet hold the HOD role, grants it in the
++same transaction; revoking an assignment removes the role only when it was the person's
++last one.
++
+ ### Permission catalogue
+ 
+ The single source of truth is `app/core/permissions.py` (`PermissionCode`). It
+@@ -237,7 +253,7 @@ the allow-list. Removing a permission is always allowed.
  |---|---|
  | `GET /users` (q, role, is_active, department_id, limit ≤ 100, offset) | Main Admin: all. Others: only users attached (HOD / instructor / staff assignment) to a department where the caller's **own** assignment grants `user.view`. No such department ⇒ 403. Filtering by a department outside that scope ⇒ 403. |
  | `GET /users/{id}` | self, Main Admin, or in scope. Anything else is a **404** identical to "does not exist". A scoped viewer sees only the departments within their own scope. |
@@ -989,7 +1072,7 @@ index 0f16f6d..f9b63f5 100644
  | `PATCH /users/{id}` | needs `user.update`, which **only Main Admin holds and which must stay that way**. Main Admin: names and email. (The code also supports a department-scoped holder — names only, inside their departments, never a Main Admin — but no role has that grant.) |
  
  Search matches names, full name and email case-insensitively (LIKE wildcards are
-@@ -311,7 +315,7 @@ uv run alembic upgrade head && uv run alembic check
+@@ -311,7 +327,7 @@ uv run alembic upgrade head && uv run alembic check
  | Refresh tokens: any reuse is theft | Reuse of the immediately-previous token within 10 s (max 5) is a concurrent retry; otherwise theft (§3) |
  | "Deactivate access" for staff (§5.7) | Revoke one assignment; account stays active; global deactivation is Main Admin only (§7) |
  | Staff authority from role permissions | Staff have none; authority is per assignment (§6) |
@@ -998,7 +1081,7 @@ index 0f16f6d..f9b63f5 100644
  | Legacy permission placeholders | Kept, with grants, until their modules are designed |
  | `attendance.update`, `course.instructor.assign`, `result.view` | Renamed to the plan's `attendance.correct`, `course.assign_instructor`, `results.view` |
  
-@@ -322,8 +326,11 @@ Accepted as intentional future-phase work; none blocks Phase 1:
+@@ -322,8 +338,11 @@ Accepted as intentional future-phase work; none blocks Phase 1:
  * **Department creation / editing** (Phase 3): until then HOD assignment and
    staff flows are exercised with database-seeded departments.
  * **Student account creation** and **roll-number search/uniqueness** (Phase 4;
@@ -1012,7 +1095,7 @@ index 0f16f6d..f9b63f5 100644
  * **Instructor account creation** and **employee-ID search/uniqueness**
    (Phase 6; FR-02-2, 02-12).
  * **Re-assigning an existing account to a new departmental responsibility**
-@@ -337,10 +344,13 @@ Accepted as intentional future-phase work; none blocks Phase 1:
+@@ -337,10 +356,13 @@ Accepted as intentional future-phase work; none blocks Phase 1:
    …): reconcile when their modules are designed. Nothing may be silently removed;
    any rename follows the in-place rename mechanism so ids and grants survive, and
    is documented.
@@ -1170,7 +1253,7 @@ index d706fe7..5956dd3 100644
  ## 10. Testing summary
  
 diff --git a/docs/phase4-student-registration.md b/docs/phase4-student-registration.md
-index 45a1513..02168a9 100644
+index 45a1513..9eeb15b 100644
 --- a/docs/phase4-student-registration.md
 +++ b/docs/phase4-student-registration.md
 @@ -1,61 +1,72 @@
@@ -1558,7 +1641,7 @@ index 45a1513..02168a9 100644
  * Both models are registered in `migrations/env.py` and `tests/conftest.py`
    (otherwise test truncation would silently skip them).
  * **Test plan (`test_phase4_migrations.py`):** build a scratch database at
-@@ -184,47 +355,66 @@ database before anything is applied to development:
+@@ -184,47 +355,77 @@ database before anything is applied to development:
    Also: a populated downgrade is refused and leaves everything intact; and a
    fresh-database round trip to base and back.
  * No RBAC seed change (no new permission codes).
@@ -1636,17 +1719,28 @@ index 45a1513..02168a9 100644
 -| Edit phone / address | yes | `student.update` | if delegated `student.update` | no | no |
 +| Edit phone / address of a student | yes | `student.update` | if delegated `student.update` | no | no |
 +| Edit **own** phone | yes | n/a | n/a | n/a | **yes, own record only** (§13) |
-+| Edit own first/last name | yes (existing) | yes (existing) | yes (existing) | yes (existing) | **no** (§13) |
++| Edit own first/last name (`PATCH /users/me`) | yes (existing), **unless the account also holds `STUDENT`** | yes (existing), **unless the account also holds `STUDENT`** | yes (existing), **unless the account also holds `STUDENT`** | yes (existing), **unless the account also holds `STUDENT`** | **no, for any account holding `STUDENT`** (§13) |
  | Resend onboarding email | yes | `student.create` | if delegated `student.create` | no | no |
  | Global search (`GET /students`) | yes | no (department route only) | no | no | no |
  | Correct roll number / admission term | yes (`user.update`) | no | no | no | no |
  | Correct initial placement | yes (`section.move_student`) | **no** | **no** | no | no |
 -| Edit name or email; deactivate account | yes (existing `/users` endpoints) | no | no | no | no |
 +| Edit another user's name or email; deactivate an account | yes (existing `/users` endpoints) | no | no | no | no |
++
++**Precedence of the student name restriction.** The restriction attaches to the
++**account**, not to the role a person is acting as. **Any account holding the `STUDENT` role
++is refused (403) on `PATCH /users/me` and cannot change its own first or last name,
++regardless of any other role it also holds** (HOD, department staff, instructor, accounts
++staff or Main Admin). For example, an account holding both `STUDENT` and `HOD` receives 403.
++The "yes (existing)" cells above apply only to accounts that do **not** hold `STUDENT`; their
++behaviour is unchanged. Unchanged by this rule: request validation still runs first (malformed,
++empty or unknown fields remain 422), enforcement is in the backend, and Main Admin's
++institutional authority to change other users' names and login emails through
++`PATCH /users/{id}` is not altered.
  
  **Field tiers** (computed once per request, role-bound):
  
-@@ -238,45 +428,51 @@ the target department.** Nothing is combined across roles.
+@@ -238,45 +439,51 @@ the target department.** Nothing is combined across roles.
  * **Account flags:** `is_active`, `is_email_verified`, `must_change_password`.
    **Main Admin only.** The department routes never return them to anyone else,
    and the department list has **no `is_active` filter** (it would leak the same
@@ -1718,7 +1812,7 @@ index 45a1513..02168a9 100644
  * Global routes use the existing global-permission dependency, which checks the
    MAIN_ADMIN role specifically (not "any role that holds the code"), so HODs and
    instructors, who hold `student.view`, never reach `GET /students`.
-@@ -284,9 +480,38 @@ placement permission.
+@@ -284,9 +491,38 @@ placement permission.
    `roles`, `is_active`, `department_id`, `status`, `picture` and the like are
    422s. Errors: 403 permission, 404 not found or out of scope, 409 conflicts,
    422 validation, 429 rate limit (with `Retry-After`).
@@ -1759,7 +1853,7 @@ index 45a1513..02168a9 100644
  
  ### Request
  
-@@ -300,8 +525,7 @@ section_id, phone, address                           (optional)
+@@ -300,8 +536,7 @@ section_id, phone, address                           (optional)
  
  * **Names:** trimmed, inner whitespace collapsed, both required.
  * **Email:** trimmed and lowercased (the login identity); any valid address.
@@ -1769,7 +1863,7 @@ index 45a1513..02168a9 100644
  * **Phone (optional), E.164, nothing guessed.** After removing spaces, hyphens
    and parentheses (formatting only), the value must be exactly one of:
    * Pakistani local notation `03` followed by nine digits (eleven digits in
-@@ -311,40 +535,40 @@ section_id, phone, address                           (optional)
+@@ -311,40 +546,40 @@ section_id, phone, address                           (optional)
  
    Everything else is rejected with a clear message rather than interpreted:
    digits without `+` (`923001234567`, `3001234567`), the `00` international
@@ -1830,7 +1924,7 @@ index 45a1513..02168a9 100644
  
  ### Transactional consistency
  
-@@ -354,28 +578,105 @@ section_id, phone, address                           (optional)
+@@ -354,28 +589,105 @@ section_id, phone, address                           (optional)
    every pre-check, so a concurrent duplicate becomes a 409 and a full rollback,
    never a half-created student.
  * The email is **never** queued before the commit, and an email failure never
@@ -1952,7 +2046,7 @@ index 45a1513..02168a9 100644
  request issues a 6-digit OTP (10 minutes, 5 attempts, 60 s cooldown, 5/hour per
  mailbox, per-IP limits); completing it sets the password, clears
  `must_change_password`, sets `is_email_verified = true`, revokes sessions and
-@@ -385,51 +686,51 @@ audits the reset. Receiving the OTP is the proof of mailbox ownership.
+@@ -385,51 +697,51 @@ audits the reset. Receiving the OTP is the proof of mailbox ownership.
  
  * **Authorization and scope first.** The caller must hold `student.create` for
    the path department, and the student must currently belong to it; otherwise
@@ -2025,7 +2119,7 @@ index 45a1513..02168a9 100644
  
  **Decision: CNIC is completely excluded from Phase 4.** There is no database
  column, no API or schema field, no registration support, no validation helper and
-@@ -437,8 +738,8 @@ no encryption code. The registration schema rejects a `cnic` field
+@@ -437,8 +749,8 @@ no encryption code. The registration schema rejects a `cnic` field
  (`extra="forbid"`), and the audit sanitizer keeps redacting any metadata key that
  mentions it.
  
@@ -2036,7 +2130,7 @@ index 45a1513..02168a9 100644
  bulk-import example mentions an "Invalid CNIC" row. **No document says why the
  system must store it.** The following remain **unanswered** and must be settled
  before anyone designs CNIC storage:
-@@ -457,44 +758,43 @@ before anyone designs CNIC storage:
+@@ -457,44 +769,43 @@ before anyone designs CNIC storage:
  If CNIC is later approved it needs its own design and approval (at minimum
  encryption at rest, a keyed blind index for uniqueness, key management and
  rotation, a dedicated restricted permission). Nothing in the Phase 4 schema
@@ -2103,7 +2197,7 @@ index 45a1513..02168a9 100644
  
  **Audit:** `student.placement.corrected` with old and new values and the reason.
  If the department changed, one entry is written for each affected department.
-@@ -502,23 +802,23 @@ If the department changed, one entry is written for each affected department.
+@@ -502,23 +813,23 @@ If the department changed, one entry is written for each affected department.
  **Consequence:** the student's department follows the new current placement
  automatically; the old department loses live access and keeps its audit history.
  
@@ -2134,7 +2228,7 @@ index 45a1513..02168a9 100644
  
  * **Account deactivation** is `users.is_active`. A deactivated account cannot
    authenticate and its sessions end. Only Main Admin may do it, through the
-@@ -531,145 +831,134 @@ automatically; the old department loses live access and keeps its audit history.
+@@ -531,145 +842,134 @@ automatically; the old department loses live access and keeps its audit history.
    current placement; until then every registered student has exactly one current
    placement.
  
