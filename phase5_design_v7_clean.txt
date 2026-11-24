@@ -1,31 +1,35 @@
-Good — no GIN index on `audit_logs.event_metadata`, but `ix_audit_logs_action` on `action` exists, which is sufficient for the reconciliation query filtering on `action = 'student.registered'`. Now I have everything I need.
-
-Writing the complete v7 design now. This is a substantial revision with 8 corrections touching nearly every section.
+All verification complete. `schedule_email` is just `background_tasks.add_task(send_email_safely, ...)` — the actual send is deferred and swallows all exceptions. Now writing the complete v8 design.
 
 ---
 
-# Phase 5 — Bulk Student Registration: Technical Design v7
+# Phase 5 — Bulk Student Registration: Technical Design v8
 
 ---
 
-## §1. Executive Summary and v6 → v7 Change Summary
+## §1. Executive Summary and v7 → v8 Change Summary
 
 Phase 5 adds CSV-based bulk student registration for Main Admin, processing up to 100 rows synchronously via the existing `register_student()` method.
 
-### v6 → v7 changes
+### v7 → v8 changes
 
-| # | Issue (user correction) | v6 behavior | v7 fix |
+| # | Issue | v7 behavior | v8 fix |
 |---|---|---|---|
-| 1 | STARTED rows prematurely reclassified as NOT_PROCESSED | After-loop converts STARTED → NOT_PROCESSED for all unfinished rows | After-loop NEVER reclassifies STARTED rows. Only rows with no child record get NOT_PROCESSED. If any STARTED rows remain, session does not terminalize; stays PROCESSING for reconciliation. |
-| 2 | Reconciliation ownership protects only final parent UPDATE; stale reconciler can mutate child rows | Claim is a separate committed transaction; child mutations unprotected | Entire reconciliation runs in a single transaction. The claim UPDATE's implicit row-level exclusive lock on `bulk_upload_sessions` is held until COMMIT/ROLLBACK. No other reconciler can re-claim or mutate children while the lock is held. |
-| 3 | T1 plain INSERT can overwrite existing child outcomes on lost-ACK retry | Direct INSERT; retry causes IntegrityError or undefined behavior | T1 uses `INSERT ... ON CONFLICT (upload_session_id, valid_row_index) DO NOTHING RETURNING id`. Conflict → skip row entirely (no T2, no T3). Existing outcome is never overwritten. |
-| 4 | Interrupted audit event contradicts "no terminal write on interruption" | §6.3 ties `bulk_import.interrupted` to terminal write; §14 says no terminal on interruption | `bulk_import.interrupted` is committed in its own after-loop transaction, separate from any terminal write. Session remains PROCESSING. At most one interrupted event per session in the synchronous model. |
-| 5 | `was_attempted` claims knowledge the system cannot establish | `was_attempted BOOLEAN NOT NULL DEFAULT FALSE` — sets FALSE for reconciled STARTED rows even though attempt may have occurred | `was_attempted BOOLEAN` (nullable). NULL = cannot determine. THREE states: TRUE (definitely invoked), FALSE (definitely never invoked), NULL (indeterminate). |
-| 6 | `csv_row_number` implies physical line number | Ambiguous terminology | Renamed to `csv_record_number`. Defined as 1-indexed ordinal of non-blank data records after the header. A multi-line quoted record counts as one record. |
-| 7 | CSV parsing rules underspecified | No strict mode, no field-size limit, no column-count check | Strict parsing: `csv.reader(strict=True)`, `field_size_limit(8192)`, column-count consistency enforced, blank-row skipping defined, malformed records rejected. |
-| 8 | T3 child and parent updates not explicitly in same transaction; zero-row child UPDATE silently ignored | Implicit but not stated | Explicitly: child outcome UPDATE and parent counter UPDATE are in the same transaction. Parent failure → both roll back. Zero-row child UPDATE → read existing status → verify consistency → log inconsistency if mismatch. |
+| 1 | After-loop reads/inserts child rows without ownership against concurrent reconciliation | After-loop runs unprotected; reconciliation could race it | After-loop acquires an exclusive lock on the session row via a conditional UPDATE (`SET heartbeat WHERE status='PROCESSING'`) with a 5-second `lock_timeout`. All child mutations, counter recalculation, and audit are within this single locked transaction. |
+| 2 | Reconciliation decision table incomplete for contradictory evidence | Only normal consistent cases defined | Complete table: SUCCEEDED+no audit, FAILED+audit, NOT_PROCESSED+audit, duplicate audits, entity-ID mismatch, malformed metadata → all classified CONTRADICTION. Any contradiction → reconciliation ROLLS BACK; session reverts to PROCESSING; error returned to admin. |
+| 3 | RECONCILING state claimed as externally observable but never durably committed under single-transaction model | State-transition table, API, and stale RECONCILING reclaim all presume RECONCILING is durable | RECONCILING acknowledged as transient in-transaction state: never visible to concurrent reads under READ COMMITTED. Stale RECONCILING reclaim rule removed. API GET never returns RECONCILING. Claim SQL checks only `status='PROCESSING' AND heartbeat stale`. |
+| 4 | Generic except covers registration, T3, AND email scheduling | Email failure after SUCCEEDED T3 sets OUTCOME_UNCERTAIN | Three separate try blocks: T2 (registration), T3 (outcome persistence), email. Email failure after committed SUCCEEDED is logged as a warning; import continues to next row. |
+| 5 | NOT_PROCESSED + `was_attempted` semantics unclear | `was_attempted=NULL` for all reconciled STARTED rows | Three-way semantic preserved. NOT_PROCESSED clarified as "no committed registration found" (not "never attempted"). OUTCOME_UNCERTAIN resolved to NOT_PROCESSED keeps `was_attempted=TRUE` (invocation known). |
+| 6 | 90-day/30-day retention claimed but no purge mechanism exists | Retention proposed as though implemented | Retention distinguished as PROPOSED (pending future purge). Current implementation: indefinite retention, explicitly accepted as temporary. Full purge specification documented (child first, FK prevents parent deletion while children exist, audit retained). |
 
-**Verdict:** READY FOR USER APPROVAL. Remaining decisions requiring approval are in §17.
+### Additional refinements
+
+| # | Refinement | Change |
+|---|---|---|
+| A1 | Audit key `bulk_upload_row_number` stores `valid_row_index`, not CSV record number | Renamed to `bulk_upload_valid_row_index` |
+| A2 | Targeted audit index for reconciliation | Proposed as pending decision: partial index on `(event_metadata->>'bulk_upload_session_id')` where `action='student.registered'` |
+| A3 | Child `student_id` has no FK | Proposed `REFERENCES users(id) ON DELETE RESTRICT` as pending decision |
+| A4 | `csv.field_size_limit(8192)` is process-wide | Documented: save/restore around parsing to avoid affecting other CSV consumers |
+| A5 | After-loop counters derived from increments, not provably consistent | After-loop recalculates all counters from child table in the same transaction |
 
 ---
 
@@ -42,99 +46,110 @@ Phase 5 adds CSV-based bulk student registration for Main Admin, processing up t
 | `MAIN_ADMIN` holds `set(PermissionCode)` (all permissions) | [auth/constants.py:16](backend/app/modules/auth/constants.py#L16) |
 | `STUDENT_BULK_IMPORT` NOT in `DELEGABLE_STAFF_PERMISSIONS` | [auth/constants.py:87–97](backend/app/modules/auth/constants.py#L87-L97) |
 | HOD does NOT hold `STUDENT_BULK_IMPORT` | [auth/constants.py:30–59](backend/app/modules/auth/constants.py#L30-L59) |
-| `normalize_phone()` accepts E.164 `+[1-9][0-9]{7,14}` and Pakistani local `03...` | [validators.py:95–125](backend/app/modules/students/validators.py#L95-L125) |
-| `RegistrationData` dataclass is HTTP-free, designed for bulk reuse | [service.py:87–104](backend/app/modules/students/service.py#L87-L104) |
+| `normalize_phone()` accepts E.164 and Pakistani local | [validators.py:95–125](backend/app/modules/students/validators.py#L95-L125) |
+| `RegistrationData` is HTTP-free, designed for bulk reuse | [service.py:87–104](backend/app/modules/students/service.py#L87-L104) |
 | Exception hierarchy: flat under `StudentServiceError` | [service.py:53–83](backend/app/modules/students/service.py#L53-L83) |
 | Phase 4 semester-level validation: `1 ≤ value ≤ program.duration_semesters` | [service.py:734](backend/app/modules/students/service.py#L734) |
-| DB backstop: `ck_student_placements_level` = `BETWEEN 1 AND 16` | [models.py:230](backend/app/modules/students/models.py#L230) |
-| DB backstop: `ck_programs_duration_semesters` = `BETWEEN 1 AND 16` | [programs/models.py:53–56](backend/app/modules/programs/models.py#L53-L56) |
+| DB backstops: `ck_student_placements_level BETWEEN 1 AND 16`, `ck_programs_duration_semesters BETWEEN 1 AND 16` | [models.py:230](backend/app/modules/students/models.py#L230), [programs/models.py:53–56](backend/app/modules/programs/models.py#L53-L56) |
 | Lock order: `term → department → program → section → student → placement` | [service.py:192–194](backend/app/modules/students/service.py#L192-L194) |
 | `pool_pre_ping=True` | [database.py:13–16](backend/app/core/database.py#L13-L16) |
-| Audit indexes: `ix_audit_logs_action` on `action` column; NO GIN index on `event_metadata` | [audit/models.py:68–74](backend/app/modules/audit/models.py#L68-L74) |
-| `NO_DELETE_TABLES` and `COLUMN_UPDATE_TABLES` in provision script | [provision_db_roles.py:47–75](backend/scripts/provision_db_roles.py#L47-L75) |
-| `APPEND_ONLY_TABLES` = `("audit_logs",)` | [provision_db_roles.py:39](backend/scripts/provision_db_roles.py#L39) |
+| Audit indexes: `ix_audit_logs_action` on `action`; no GIN index on `event_metadata` | [audit/models.py:68–74](backend/app/modules/audit/models.py#L68-L74) |
+| `schedule_email` → `background_tasks.add_task(send_email_safely, ...)` — deferred, never raises in practice | [email.py:140–149](backend/app/core/email.py#L140-L149) |
+| `send_email_safely` catches all exceptions internally | [email.py:152–163](backend/app/core/email.py#L152-L163) |
+| Existing router calls `schedule_email` AFTER `register_student()` returns | [router.py:246–254](backend/app/modules/students/router.py#L246-L254) |
+| `NO_DELETE_TABLES`, `COLUMN_UPDATE_TABLES`, `APPEND_ONLY_TABLES` in provision script | [provision_db_roles.py:39–75](backend/scripts/provision_db_roles.py#L39-L75) |
 
 ---
 
-## §3. Approved Decisions, Pending Decisions, and New Proposals
+## §3. Decisions
 
 ### §3A. Previously Approved
 
-| # | Decision | Source |
-|---|----------|--------|
-| 1 | Main Admin only via `student.bulk_import`, not delegable | User requirements |
-| 2 | 100-row limit per file | User confirmed |
-| 3 | Synchronous processing — no Redis/Celery/RQ | User confirmed |
-| 4 | Reuse `register_student()` per row | User confirmed |
-| 5 | Partial success mandatory — never all-or-nothing | User confirmed (v2) |
-| 6 | Five outcome types: SUCCEEDED, FAILED, NOT_PROCESSED, OUTCOME_UNCERTAIN, SKIPPED_PREVIEW_INVALID | User confirmed (v2) |
-| 7 | File expires after 30 minutes without confirmation | User confirmed |
-| 8 | Zero valid rows → 409, no confirmation | User confirmed (v3) |
-| 9 | CSV-only downloadable report | User confirmed (v3) |
-| 10 | Model in `bulk_models.py`, service in `bulk_service.py` | User confirmed (v3) |
-| 11 | Student profile pictures outside Phase 5 | User confirmed (v3) |
-| 12 | Email at-most-once via `BackgroundTasks` | Existing behavior |
-| 13 | Any Main Admin retrieves results | User confirmed (v3) |
-| 14 | CSV-only upload format | User requirements |
-| 15 | Heartbeat every row | User confirmed (v3) |
+| # | Decision |
+|---|----------|
+| 1 | Main Admin only via `student.bulk_import`, not delegable |
+| 2 | 100-row limit per file |
+| 3 | Synchronous processing — no Redis/Celery/RQ |
+| 4 | Reuse `register_student()` per row |
+| 5 | Partial success mandatory — never all-or-nothing |
+| 6 | Five outcome types: SUCCEEDED, FAILED, NOT_PROCESSED, OUTCOME_UNCERTAIN, SKIPPED_PREVIEW_INVALID |
+| 7 | File expires after 30 minutes without confirmation |
+| 8 | Zero valid rows → 409, no confirmation |
+| 9 | CSV-only downloadable report |
+| 10 | Model in `bulk_models.py`, service in `bulk_service.py` |
+| 11 | Student profile pictures outside Phase 5 |
+| 12 | Email at-most-once via `BackgroundTasks` |
+| 13 | Any Main Admin retrieves results |
+| 14 | CSV-only upload format |
+| 15 | Heartbeat every row |
 
-### §3B. Proposed in v4–v6, Still Pending Approval
+### §3B. Proposed in v4–v7, Still Pending
 
-| # | Decision | First proposed |
-|---|----------|---------------|
-| P1 | 5-minute stale PROCESSING heartbeat threshold | v3 |
-| P2 | FOR SHARE fencing inside `register_student()` | v4 |
-| P3 | `BulkImportOrigin` frozen dataclass for audit context | v4 |
-| P4 | `BulkImportSessionFencedError` exception class | v5 |
-| P5 | `reconciliation_claim_token UUID` for defense-in-depth | v5 |
-| P6 | `preview_invalid_results` JSONB column (PII-free, never scrubbed) | v5 |
-| P7 | `expires_at TIMESTAMPTZ` with lazy expiry | v5 |
-| P8 | Column-aware formula validation (phone exempt) | v5 |
-| P9 | Confirm endpoint returns HTTP 200 | v5 |
-| P10 | `bulk_upload_row_results` child table with `UNIQUE (upload_session_id, valid_row_index)` | v6 |
-| P11 | `valid_row_index` separate from record number | v6 |
-| P12 | Terminal states enforce `uncertain_count = 0`; uncertain sessions stay PROCESSING | v6 |
-| P13 | `was_reconciled BOOLEAN NOT NULL DEFAULT FALSE` column | v6 |
-| P14 | 10-second reconciliation lock timeout | v6 |
-| P15 | 5-minute stale RECONCILING threshold | v6 |
-| P16 | 90-day terminal session retention | v6 |
-| P17 | 30-day expired session retention | v6 |
-| P18 | Dedicated `uncertain_count` column | v6 |
+| # | Decision | First | Section |
+|---|----------|-------|---------|
+| P1 | 5-min stale PROCESSING heartbeat threshold | v3 | §6, §10 |
+| P2 | FOR SHARE fencing inside `register_student()` | v4 | §8 |
+| P3 | `BulkImportOrigin` frozen dataclass | v4 | §8, §14 |
+| P4 | `BulkImportSessionFencedError` extends `StudentServiceError` directly | v5 | §9 |
+| P5 | `reconciliation_claim_token UUID` (defense-in-depth) | v5 | §10 |
+| P6 | `preview_invalid_results` JSONB (PII-free, never scrubbed) | v5 | §4 |
+| P7 | `expires_at TIMESTAMPTZ` with lazy expiry | v5 | §4, §6 |
+| P8 | Column-aware formula validation (phone exempt) | v5 | §5 |
+| P9 | Confirm returns HTTP 200 | v5 | §12 |
+| P10 | `bulk_upload_row_results` child table with UNIQUE | v6 | §4 |
+| P11 | `valid_row_index` separate from `csv_record_number` | v6 | §4, §5 |
+| P12 | Terminal enforces `uncertain_count=0`; uncertain stays PROCESSING | v6 | §3D |
+| P13 | `was_reconciled BOOLEAN NOT NULL DEFAULT FALSE` | v6 | §4 |
+| P14 | 10-second reconciliation lock timeout | v6 | §10 |
+| P15 | Dedicated `uncertain_count` column | v6 | §4 |
+| P16 | After-loop never reclassifies STARTED; inserts NOT_PROCESSED only for missing rows | v7 | §9 |
+| P17 | T1 uses `INSERT ON CONFLICT DO NOTHING RETURNING id`; conflict → skip | v7 | §7 |
+| P18 | `was_attempted BOOLEAN` nullable | v7 | §4, §11 |
+| P19 | `csv_record_number` column name | v7 | §4, §5 |
+| P20 | Strict CSV: `strict=True`, `field_size_limit`, column-count | v7 | §5 |
+| P21 | T3 consistency: verify existing child-row status on zero-row UPDATE | v7 | §7 |
 
-### §3C. New in v7, Requiring Approval
+### §3C. New in v8, Requiring Approval
 
 | # | Decision | Section |
 |---|----------|---------|
-| N1 | After-loop never reclassifies STARTED rows; only inserts NOT_PROCESSED for rows with no child record | §9 |
-| N2 | Reconciliation runs in a single transaction with the claim (FOR UPDATE lock held throughout) | §10 |
-| N3 | T1 uses `INSERT ... ON CONFLICT DO NOTHING RETURNING id`; conflict → skip row | §7 |
-| N4 | `bulk_import.interrupted` audit committed in after-loop transaction while session stays PROCESSING | §14 |
-| N5 | `was_attempted BOOLEAN` nullable; NULL = indeterminate | §4, §11 |
-| N6 | `csv_record_number` column name (not `csv_row_number`) | §4, §5 |
-| N7 | Strict CSV: `strict=True`, `field_size_limit(8192)`, column-count consistency | §5 |
-| N8 | T3 consistency: verify existing child-row status on zero-row UPDATE | §7 |
+| N1 | After-loop acquires exclusive lock on session row via conditional heartbeat UPDATE with 5s `lock_timeout`; all after-loop work in that transaction | §9 |
+| N2 | Reconciliation rolls back on any contradictory evidence; session reverts to PROCESSING | §10 |
+| N3 | RECONCILING is a transient in-transaction state, never externally observable; stale RECONCILING reclaim removed; claim checks only `status='PROCESSING'` | §3D, §8, §10, §12 |
+| N4 | Separate try blocks for T2, T3, and email in the import loop | §9 |
+| N5 | NOT_PROCESSED redefined as "no committed registration found" | §11 |
+| N6 | Audit metadata key renamed to `bulk_upload_valid_row_index` | §14 |
+| N7 | Proposed: partial audit index for reconciliation lookup | §14 |
+| N8 | Proposed: child `student_id REFERENCES users(id) ON DELETE RESTRICT` | §4 |
+| N9 | `csv.field_size_limit` save/restore around parsing | §5 |
+| N10 | After-loop recalculates all counters from child table | §9 |
+| N11 | Proposed: 90-day terminal / 30-day expired retention (purge mechanism deferred) | §13 |
+| N12 | 5-min stale RECONCILING reclaim removed (was P15 in v7; meaningless under single-tx model) | §3D |
 
 ### §3D. State-Transition Table
+
+**Externally observable states:** PENDING_CONFIRMATION, EXPIRED, PROCESSING, COMPLETED, PARTIALLY_COMPLETED, FAILED.
+
+**Transient in-transaction state:** RECONCILING — set within the reconciliation transaction but never committed as RECONCILING. The transaction either commits with a terminal status or rolls back to PROCESSING. Under READ COMMITTED isolation, concurrent reads never observe RECONCILING. Retained in the CHECK constraint for in-transaction use only.
 
 | Current state | Trigger | New state | Condition |
 |---|---|---|---|
 | PENDING_CONFIRMATION | Confirm endpoint | PROCESSING | `expires_at > now()` |
 | PENDING_CONFIRMATION | Any read (lazy) | EXPIRED | `expires_at ≤ now()` |
-| PROCESSING | Import completes, no STARTED/uncertain, `imported = valid_count` | COMPLETED | `uncertain = 0`, all rows definitive |
-| PROCESSING | Import completes, no STARTED/uncertain, `0 < imported < valid_count` | PARTIALLY_COMPLETED | `uncertain = 0`, all rows definitive |
-| PROCESSING | Import completes, no STARTED/uncertain, `imported = 0` | FAILED | `uncertain = 0`, all rows definitive |
-| PROCESSING | Import interrupted, STARTED rows or uncertain remain | PROCESSING (stays) | No terminal write; heartbeat goes stale |
-| PROCESSING | Reconciliation claim | RECONCILING | heartbeat stale (> P1 threshold) |
-| RECONCILING | Reconciliation finishes | COMPLETED / PARTIALLY_COMPLETED / FAILED | Token matches, `uncertain = 0`, all rows definitive |
-| RECONCILING | Re-claim | RECONCILING | `reconciliation_started_at` stale (> P15 threshold), new token |
+| PROCESSING | Import completes, all rows definitive | COMPLETED | `imported = valid_count`, no STARTED/uncertain |
+| PROCESSING | Import completes, all rows definitive | PARTIALLY_COMPLETED | `0 < imported < valid_count`, no STARTED/uncertain |
+| PROCESSING | Import completes, all rows definitive | FAILED | `imported = 0`, no STARTED/uncertain |
+| PROCESSING | Import interrupted, unresolved rows | PROCESSING (stays) | No terminal write; heartbeat goes stale |
+| PROCESSING | Reconciliation (single tx) | COMPLETED / PARTIALLY_COMPLETED / FAILED | Heartbeat stale, all rows resolved, no contradictions |
+| PROCESSING | Reconciliation (single tx), contradictions | PROCESSING (stays) | Reconciliation rolls back |
 
-**Disallowed transitions:** EXPIRED, COMPLETED, PARTIALLY_COMPLETED, FAILED → anything. PROCESSING → EXPIRED. RECONCILING → PROCESSING.
+**Disallowed:** EXPIRED, COMPLETED, PARTIALLY_COMPLETED, FAILED → anything. PROCESSING → EXPIRED.
 
-**Key invariant:** No terminal state is reachable with `uncertain_count > 0` or any STARTED child rows. If the import loop has unresolved rows, it does NOT write terminal status. The session stays PROCESSING for reconciliation.
+**Why stale RECONCILING reclaim is removed:** Under the single-transaction model, RECONCILING is never committed. If the reconciliation transaction rolls back (connection loss, contradiction, any error), the session reverts to PROCESSING. The session's heartbeat is stale (last updated by the import loop or after-loop). A subsequent reconciliation claim succeeds via the `status='PROCESSING' AND heartbeat stale` check. No separate RECONCILING reclaim path is needed.
 
 ---
 
-## §4. Complete Database Schema, Constraints, Indexes, and Privileges
+## §4. Complete Database Schema
 
 ### §4.1. `bulk_upload_sessions` table
 
@@ -160,7 +175,7 @@ CREATE TABLE bulk_upload_sessions (
     not_processed_count       INTEGER NOT NULL DEFAULT 0,
     uncertain_count           INTEGER NOT NULL DEFAULT 0,
 
-    -- Progress (denormalized; child table is authoritative)
+    -- Progress
     last_started_valid_index  INTEGER NOT NULL DEFAULT 0,
 
     -- Lifecycle
@@ -178,7 +193,6 @@ CREATE TABLE bulk_upload_sessions (
     reconciliation_claim_token UUID,
     was_reconciled             BOOLEAN NOT NULL DEFAULT FALSE,
 
-    -- Timestamps
     created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -189,38 +203,30 @@ CREATE TABLE bulk_upload_sessions (
             'COMPLETED', 'PARTIALLY_COMPLETED', 'FAILED'
         )
     ),
-    CONSTRAINT ck_bulk_sessions_total_rows CHECK (
-        total_rows BETWEEN 1 AND 100
-    ),
+    CONSTRAINT ck_bulk_sessions_total_rows CHECK (total_rows BETWEEN 1 AND 100),
     CONSTRAINT ck_bulk_sessions_preview_counts CHECK (
-        valid_count >= 0
-        AND invalid_count >= 0
+        valid_count >= 0 AND invalid_count >= 0
         AND total_rows = valid_count + invalid_count
     ),
     CONSTRAINT ck_bulk_sessions_import_counts CHECK (
-        imported_count >= 0
-        AND failed_count >= 0
-        AND not_processed_count >= 0
-        AND uncertain_count >= 0
-        AND (
-            CASE
-                WHEN status IN ('COMPLETED', 'PARTIALLY_COMPLETED', 'FAILED')
-                THEN imported_count + failed_count + not_processed_count = valid_count
-                     AND uncertain_count = 0
-                ELSE imported_count + failed_count + not_processed_count
-                     + uncertain_count <= valid_count
-            END
-        )
+        imported_count >= 0 AND failed_count >= 0
+        AND not_processed_count >= 0 AND uncertain_count >= 0
+        AND (CASE
+            WHEN status IN ('COMPLETED','PARTIALLY_COMPLETED','FAILED')
+            THEN imported_count + failed_count + not_processed_count = valid_count
+                 AND uncertain_count = 0
+            ELSE imported_count + failed_count + not_processed_count
+                 + uncertain_count <= valid_count
+        END)
     ),
-    CONSTRAINT ck_bulk_sessions_file_size CHECK (
-        file_size_bytes BETWEEN 1 AND 5000000
-    ),
+    CONSTRAINT ck_bulk_sessions_file_size CHECK (file_size_bytes BETWEEN 1 AND 5000000),
     CONSTRAINT ck_bulk_sessions_progress CHECK (
-        last_started_valid_index >= 0
-        AND last_started_valid_index <= valid_count
+        last_started_valid_index >= 0 AND last_started_valid_index <= valid_count
     )
 );
 ```
+
+**RECONCILING in CHECK:** Required for the in-transaction UPDATE to pass the CHECK evaluation. The reconciliation transaction sets `status='RECONCILING'` then later sets terminal. Both must pass the CHECK at statement time. RECONCILING is never the committed value.
 
 ### §4.2. `bulk_upload_row_results` child table
 
@@ -232,16 +238,14 @@ CREATE TABLE bulk_upload_row_results (
     valid_row_index       INTEGER NOT NULL,
     csv_record_number     INTEGER NOT NULL,
 
-    -- Outcome
     status                VARCHAR(30) NOT NULL DEFAULT 'STARTED',
-    student_id            UUID,
+    student_id            UUID REFERENCES users(id) ON DELETE RESTRICT,
     error_code            VARCHAR(50),
     error_message         VARCHAR(500),
     corrective_action     VARCHAR(500),
     is_retryable          BOOLEAN,
     was_attempted         BOOLEAN,
 
-    -- Minimal identifying info for report (no email/phone/address)
     first_name            VARCHAR(100),
     last_name             VARCHAR(100),
     roll_number           VARCHAR(30),
@@ -252,36 +256,27 @@ CREATE TABLE bulk_upload_row_results (
     CONSTRAINT uq_row_results_session_index
         UNIQUE (upload_session_id, valid_row_index),
     CONSTRAINT ck_row_results_status CHECK (
-        status IN (
-            'STARTED', 'SUCCEEDED', 'FAILED',
-            'NOT_PROCESSED', 'OUTCOME_UNCERTAIN'
-        )
+        status IN ('STARTED','SUCCEEDED','FAILED','NOT_PROCESSED','OUTCOME_UNCERTAIN')
     ),
-    CONSTRAINT ck_row_results_valid_row_index CHECK (
-        valid_row_index >= 1
-    ),
-    CONSTRAINT ck_row_results_csv_record_number CHECK (
-        csv_record_number >= 1
-    )
+    CONSTRAINT ck_row_results_valid_row_index CHECK (valid_row_index >= 1),
+    CONSTRAINT ck_row_results_csv_record_number CHECK (csv_record_number >= 1)
 );
 
-CREATE INDEX ix_row_results_session
-    ON bulk_upload_row_results (upload_session_id);
+CREATE INDEX ix_row_results_session ON bulk_upload_row_results (upload_session_id);
 ```
 
-**Changes from v6:**
-- `csv_row_number` → `csv_record_number` (§1 correction 6).
-- `was_attempted BOOLEAN` is now **nullable** with no default (§1 correction 5). T1 inserts `NULL`; T3 or after-loop or reconciliation sets the definitive value.
+**Changes from v7:**
+- `student_id` now has `REFERENCES users(id) ON DELETE RESTRICT` (pending approval N8). Ensures referential integrity. Users are never hard-deleted, so RESTRICT is consistent.
+- `was_attempted BOOLEAN` — nullable, no default (v7 P18 preserved).
+- `csv_record_number` (v7 P19 preserved).
 
 ### §4.3. `was_attempted` column semantics
 
 | Value | Meaning | Set by |
 |---|---|---|
-| `TRUE` | Registration function was definitely invoked for this row. | T3 (SUCCEEDED, FAILED, OUTCOME_UNCERTAIN) |
-| `FALSE` | Registration function was definitely never invoked. | After-loop (never-started rows); reconciliation (no child row + no audit) |
-| `NULL` | Whether registration was invoked cannot be determined. | T1 (initial); reconciliation (STARTED child + no audit) |
-
-**Rationale:** When reconciliation resolves a STARTED child row with no audit record, the row is classified NOT_PROCESSED (no student exists). But the system cannot determine whether `register_student()` was called and rolled back (attempt occurred, then lost) or was never called (crash before T2). Setting `was_attempted = NULL` is honest; FALSE would claim certainty the system does not possess.
+| `TRUE` | Registration function was definitely invoked. | T3 (all outcomes); reconciliation (OUTCOME_UNCERTAIN resolved either way; STARTED+audit) |
+| `FALSE` | Registration function was definitely never invoked. | After-loop (never-started rows with no child); reconciliation (no child + no audit) |
+| `NULL` | Whether registration was invoked cannot be determined. | T1 (initial); reconciliation (STARTED + no audit) |
 
 ### §4.4. Privileges
 
@@ -305,123 +300,49 @@ CREATE INDEX ix_row_results_session
 | NOT updatable | `id`, `upload_session_id`, `valid_row_index`, `csv_record_number`, `created_at` |
 | DELETE | NOT granted |
 
-Both tables added to `NO_DELETE_TABLES` in [provision_db_roles.py](backend/scripts/provision_db_roles.py). Both tables added to `COLUMN_UPDATE_TABLES` with the updatable columns listed above.
+Both added to `NO_DELETE_TABLES` and `COLUMN_UPDATE_TABLES`.
 
 ---
 
-## §5. CSV Parsing and Preview Behavior
+## §5. CSV Parsing and Preview
 
-### §5.1. File acceptance (content-based, not MIME-based)
+### §5.1. File acceptance (content-based)
 
-The upload endpoint reads up to 5,000,001 bytes from the uploaded file. If more data remains, return 413 immediately without buffering the entire file.
+Read up to 5,000,001 bytes. If more data remains → 413.
 
-Acceptance is determined by content, not MIME type or extension:
+1. UTF-8 decode. Strip BOM. Failure → 422.
+2. Strict CSV parse: `csv.reader(strict=True)`. Save/restore `csv.field_size_limit(8192)` around parsing to avoid process-wide side effects. Parse failure → 422.
+3. Header validation (§5.2).
+4. Column-count consistency: every non-blank data record must have exactly the same field count as the header. Mismatch → 400 citing record number.
+5. Count non-blank data records. Zero → 400. >100 → 400.
 
-1. **UTF-8 decode.** Attempt `bytes.decode('utf-8')`. Strip leading BOM (U+FEFF) if present. Decode failure → 422 "File is not valid UTF-8."
-2. **Strict CSV parse.** Use Python's `csv.reader` with `strict=True`. Set `csv.field_size_limit(8192)` before parsing. Any `csv.Error` → 422 with the parser's error message.
-3. **Header validation.** See §5.2.
-4. **Column-count consistency.** Every non-blank data record must have exactly the same number of fields as the header row. A mismatch → 400 "Record N has M fields, expected K."
-5. **Data record count.** Count non-blank data records (§5.3). Zero → 400 "No data records." More than 100 → 400 "Maximum 100 data records."
+### §5.2. Headers
 
-### §5.2. Header validation
+Required (case-insensitive, trimmed): `first_name`, `last_name`, `email`, `roll_number`, `program_code`, `semester_level`, `admission_term`. Optional: `section_name`, `phone`, `address`. Missing required → 400. Duplicate → 400. Unknown → 400.
 
-Required (case-insensitive, trimmed): `first_name`, `last_name`, `email`, `roll_number`, `program_code`, `semester_level`, `admission_term`.
+### §5.3. Record numbering
 
-Optional: `section_name`, `phone`, `address`.
+`csv_record_number`: 1-indexed ordinal of non-blank data records after the header. A multi-line quoted record counts as one record. Blank records (all fields empty after strip) are skipped.
 
-Rejections: missing required → 400; duplicate (case-insensitive) → 400; unknown → 400.
+`valid_row_index`: assigned sequentially from 1 through `valid_count` to records that pass all preview validations, in `csv_record_number` order.
 
-### §5.3. Record numbering and blank-row handling
+### §5.4. Formula-cell validation
 
-**Definitions:**
+Checked columns: all except `phone`. Phone exempt — `normalize_phone()` rejects non-phone values.
 
-- A **CSV record** is one logical record as parsed by `csv.reader`. A record may span multiple physical lines if it contains a quoted field with embedded newlines.
-- A **blank record** is one where every field is empty after stripping whitespace.
-- `csv_record_number` is the **1-indexed ordinal of non-blank data records**, counting sequentially from the first record after the header. Blank records are skipped and do not receive a number.
-
-**Example with multi-line quoted field:**
-
-```csv
-first_name,last_name,email,roll_number,program_code,semester_level,admission_term,address
-Ahmad,Khan,a@x.com,CS-001,BSCS,1,Fall 2026,"123 Main St
-Apt 4B"
-Sara,Ali,s@x.com,CS-002,BSCS,1,Fall 2026,456 Oak Ave
-```
-
-Record 1 (Ahmad) spans physical lines 2–3 but is one CSV record. `csv_record_number = 1`.
-Record 2 (Sara) is on physical line 4. `csv_record_number = 2`.
-
-**`valid_row_index`** is assigned to records that pass all preview validations, numbered sequentially from 1 through `valid_count` in `csv_record_number` order.
-
-`valid_row_index` is used for: processing order, T1 progress tracking, child-table uniqueness, reconciliation, finding unprocessed rows.
-
-`csv_record_number` is preserved for: preview display, results display, downloadable report.
-
-### §5.4. Column-aware formula-cell validation
-
-**Formula-trigger characters:** `= @ \t \r \n`
-
-**Checked columns:** `first_name`, `last_name`, `email`, `roll_number`, `program_code`, `semester_level`, `admission_term`, `section_name`, `address`.
-
-**Exempt column:** `phone` — valid E.164 numbers start with `+`. The existing `normalize_phone()` at [validators.py:95–125](backend/app/modules/students/validators.py#L95-L125) rejects non-phone values (`+SUM(1,2)` fails `^\+[1-9][0-9]{7,14}$`).
-
-**Rules for checked columns:**
-1. First character in `{= @ \t \r \n}` → reject: `FORMULA_CELL`.
-2. First character is `+` or `-` → reject: `FORMULA_CELL`.
-3. First non-whitespace character (after leading spaces) is in `{= + - @}` → reject: `FORMULA_CELL`.
+Rules: First char in `{= @ \t \r \n}` → reject. First char is `+` or `-` → reject. First non-whitespace in `{= + - @}` → reject.
 
 ### §5.5. Semester-level validation
 
-Parse `semester_level` as an integer. Reject non-integer values. Check `≥ 1` as a minimum sanity check.
+Parse as integer, check `≥ 1`. After resolving program, check `≤ program.duration_semesters`. No arbitrary cap in CSV code.
 
-After resolving the program via `program_code`, check `semester_level ≤ program.duration_semesters`. This is the existing Phase 4 business rule at [service.py:734](backend/app/modules/students/service.py#L734). No arbitrary upper cap in CSV code — the bound comes from the resolved program.
+### §5.6. `preview_invalid_results`
 
-The database backstops `ck_student_placements_level BETWEEN 1 AND 16` and `ck_programs_duration_semesters BETWEEN 1 AND 16` remain unchanged.
+PII-free error summaries for invalid records. Immutable after upload (not in UPDATE grants). Never scrubbed.
 
-### §5.6. Academic reference resolution
+### §5.7. `expires_at`
 
-Exact match only, no fuzzy matching:
-- `program_code` → `lower(code) = lower(input)` against active programs in the target department.
-- `admission_term` → `derive_term_name()` comparison against non-archived terms. Case-insensitive, trimmed.
-- `section_name` → `lower(name)` match against active sections of the resolved program at the given `semester_level`. Optional.
-
-### §5.7. `preview_invalid_results`
-
-Stored at upload time. Contains PII-free error summaries for invalid records:
-
-```json
-[
-  {
-    "csv_record_number": 7,
-    "errors": [
-      {"field": "email", "code": "REQUIRED", "message": "Email is required."},
-      {"field": "semester_level", "code": "OUT_OF_RANGE",
-       "message": "Semester level must be between 1 and 8 for this program."}
-    ]
-  }
-]
-```
-
-No original cell values, email, phone, address, or names. Never scrubbed. Immutable after upload.
-
-### §5.8. `expires_at`
-
-Set at upload: `created_at + INTERVAL '30 minutes'`. Immutable after upload (not in UPDATE grants).
-
-### §5.9. Strict parsing summary
-
-| Concern | Behavior |
-|---------|----------|
-| File > 5 MB | 413 — rejected before full read |
-| Not UTF-8 | 422 |
-| BOM present | Stripped silently |
-| `strict=True` | Malformed quoting → 422 |
-| `field_size_limit(8192)` | Any field > 8 KB → 422 |
-| Inconsistent column count | 400 with record number |
-| All-blank records | Skipped, no record number assigned |
-| Embedded newlines in quoted fields | Valid CSV; one record, one `csv_record_number` |
-| > 100 non-blank records | 400 |
-| 0 non-blank records | 400 |
+`created_at + INTERVAL '30 minutes'`. Immutable after upload.
 
 ---
 
@@ -443,45 +364,37 @@ WHERE id = :upload_id
 RETURNING id;
 ```
 
-0 rows → check actual status: if PENDING_CONFIRMATION with `expires_at ≤ now()` → lazily transition to EXPIRED, return 409; if other state → 409; if not found → 404.
+0 rows → check status: expired → lazy expire + 409; other → 409; not found → 404.
 
-Audit event `bulk_import.confirmed` is recorded via `AuditService.record()` (flush only) in the same transaction as this UPDATE. The caller commits both atomically.
+`bulk_import.confirmed` audit in the same transaction (flush only). Caller commits both.
 
 ### §6.2. Lazy expiry
 
-On any read of a PENDING_CONFIRMATION session with `expires_at ≤ now()`:
-
 ```sql
 UPDATE bulk_upload_sessions
-SET status = 'EXPIRED',
-    validated_rows = '[]',
-    updated_at = now()
+SET status = 'EXPIRED', validated_rows = '[]', updated_at = now()
 WHERE id = :upload_id
   AND status = 'PENDING_CONFIRMATION'
   AND expires_at <= now();
 ```
 
-No background worker. Expiry is detected on access only.
-
 ### §6.3. Audit event transaction boundaries
 
-| Event | Transaction boundary |
-|-------|---------------------|
-| `bulk_import.uploaded` | Same transaction as the INSERT of `bulk_upload_sessions` |
-| `bulk_import.confirmed` | Same transaction as the confirmation UPDATE |
-| `bulk_import.completed` | Same transaction as the terminal status UPDATE + `validated_rows` scrub |
-| `bulk_import.interrupted` | After-loop transaction (session remains PROCESSING; see §9.4 and §14) |
-| `bulk_import.reconciled` | Same transaction as the reconciliation terminal UPDATE (see §10) |
+| Event | Transaction |
+|-------|------------|
+| `bulk_import.uploaded` | Same as session INSERT |
+| `bulk_import.confirmed` | Same as confirmation UPDATE |
+| `bulk_import.completed` | Same as terminal write (after-loop) |
+| `bulk_import.interrupted` | Same as after-loop NOT_PROCESSED inserts + counter update (session stays PROCESSING) |
+| `bulk_import.reconciled` | Same as reconciliation terminal write |
 
-Each uses `AuditService.record()`, which calls `flush()` only. The caller's `db.commit()` commits both the state change and the audit record atomically.
-
-**Interruption specifics (correction 4):** The `bulk_import.interrupted` event does NOT share a transaction with any terminal status write, because no terminal write occurs when STARTED or uncertain rows remain. It is committed in the after-loop transaction that also inserts NOT_PROCESSED child rows for never-started indexes. See §9.4 for details.
+Each uses `AuditService.record()` → flush only → committed by caller.
 
 ---
 
-## §7. Durable Row-Progress Model: T1, T2, T3 Transaction Boundaries
+## §7. T1 / T2 / T3 Transaction Boundaries
 
-### §7.1. T1 — STARTED child row (safe for existing rows)
+### §7.1. T1 — STARTED child row (ON CONFLICT safe)
 
 ```
 T1 for valid_row_index = I, csv_record_number = R:
@@ -498,60 +411,41 @@ T1 for valid_row_index = I, csv_record_number = R:
           processing_heartbeat_at = now(),
           updated_at = now()
       WHERE id = :session_id AND status = 'PROCESSING'
-    IF session UPDATE rowcount = 0 → ROLLBACK → result: FENCED
-    ELSE → COMMIT → result: PROCEED
+    IF rowcount = 0 → ROLLBACK → FENCED
+    ELSE → COMMIT → PROCEED
 
-  IF RETURNING yields no rows (conflict — row already exists):
-    ROLLBACK → result: SKIP
+  IF RETURNING yields no rows (conflict):
+    ROLLBACK → SKIP
 ```
 
-**Conflict behavior by existing child-row status:**
+**ON CONFLICT DO NOTHING proof:**
+1. `DO NOTHING` modifies zero columns. Existing status/student_id/errors untouched.
+2. On conflict, the loop skips the row. T2 never called. No duplicate registration.
+3. Heartbeat/progress NOT updated for skipped rows.
 
-| Existing status | T1 action | T2 called? | Rationale |
+**Behavior by existing child-row status:**
+
+| Existing | T1 result | T2? | Rationale |
 |---|---|---|---|
-| STARTED | SKIP | No | May be from a lost-ACK T1 retry, or T2 may have been attempted. Reconciliation will inspect audit to determine outcome. |
-| SUCCEEDED | SKIP | No | Already processed. Student exists. |
-| FAILED | SKIP | No | Already processed. Business error recorded. |
-| NOT_PROCESSED | SKIP | No | Already classified by prior after-loop or reconciliation. |
-| OUTCOME_UNCERTAIN | SKIP | No | Already classified. Reconciliation will resolve. |
-
-**Proof that ON CONFLICT DO NOTHING cannot reset progress or permit duplicate registration:**
-
-1. `DO NOTHING` does not modify any column of the existing row. The existing status, student_id, error info, was_attempted — all untouched.
-2. When conflict is detected (RETURNING yields no rows), the importer skips the row entirely. `register_student()` is never called for this row. No duplicate registration can occur.
-3. The heartbeat and `last_started_valid_index` are NOT updated for skipped rows (the INSERT was a no-op, so the parent UPDATE is never reached).
+| STARTED | SKIP | No | May have been attempted. Reconciliation resolves. |
+| SUCCEEDED | SKIP | No | Already done. |
+| FAILED | SKIP | No | Already done. |
+| NOT_PROCESSED | SKIP | No | Already classified. |
+| OUTCOME_UNCERTAIN | SKIP | No | Reconciliation resolves. |
 
 ### §7.2. T2 — Registration
 
-```
-T2: register_student(
-      ...,
-      bulk_origin=BulkImportOrigin(session_id, I)
-    )
-
-  Internally:
-    FOR SHARE on bulk_upload_sessions (fencing check — §8)
-    _lock_and_validate() (FOR SHARE on term, department, program, section)
-    Create User, Student, Placement
-    AuditService.record() — flush only
-    COMMIT (line 309) — student + audit durable
-
-  OR: ROLLBACK + raise (lines 248, 311, 322)
-```
-
-T2 is `register_student()`'s internal transaction. It commits or rolls back independently. The import loop does not control this transaction boundary.
+`register_student()` owns its own transaction. Commits at [service.py:309](backend/app/modules/students/service.py#L309) or rolls back at [248/311/322](backend/app/modules/students/service.py#L248). The import loop does not control this boundary.
 
 ### §7.3. T3 — Outcome persistence (child + parent atomic)
 
 ```
-T3 for valid_row_index = I:
+T3 for valid_row_index = I, intended outcome = O:
 
-  BEGIN (implicit — SQLAlchemy session after T2's commit/rollback is clean)
+  BEGIN
 
   UPDATE bulk_upload_row_results
-    SET status = :outcome,
-        student_id = :sid,
-        was_attempted = TRUE,
+    SET status = O, student_id = :sid, was_attempted = TRUE,
         first_name = :fn, last_name = :ln, roll_number = :rn,
         error_code = :ec, error_message = :em,
         corrective_action = :ca, is_retryable = :ir,
@@ -560,74 +454,30 @@ T3 for valid_row_index = I:
       AND valid_row_index = I
       AND status = 'STARTED'
 
-  child_rowcount = affected rows
-
   IF child_rowcount = 1:
-    -- Normal path: update parent counter + heartbeat
     UPDATE bulk_upload_sessions
       SET <counter>_count = <counter>_count + 1,
           processing_heartbeat_at = now(),
           updated_at = now()
       WHERE id = :session_id AND status = 'PROCESSING'
-
-    IF session UPDATE rowcount = 0:
-      ROLLBACK → result: FENCED (child update also rolled back)
-    ELSE:
-      COMMIT → result: OK
+    IF parent_rowcount = 0 → ROLLBACK → FENCED
+      (child update also rolled back — same transaction)
+    ELSE → COMMIT → OK
 
   IF child_rowcount = 0:
-    -- Child row not in STARTED state — verify consistency
-    existing_status = SELECT status FROM bulk_upload_row_results
+    existing = SELECT status FROM bulk_upload_row_results
       WHERE upload_session_id = :session_id AND valid_row_index = I
-
-    IF existing_status IS NULL:
-      -- Child row missing entirely (should not happen — T1 creates it)
-      ROLLBACK
-      Log error: "Child row missing for index I"
-      result: INCONSISTENT
-
-    ELSE IF existing_status = :intended_outcome:
-      -- Idempotent: T3 previously committed but ACK was lost.
-      -- Counter was already incremented. No action needed.
-      ROLLBACK (discard the read-only transaction)
-      result: ALREADY_WRITTEN
-
+    IF existing IS NULL:
+      ROLLBACK → INCONSISTENT (child row missing — should not happen)
+    ELSE IF existing = O:
+      ROLLBACK → ALREADY_WRITTEN (idempotent; counter was already incremented)
     ELSE:
-      -- Existing status does not match intended outcome.
-      -- This indicates a bug or unexpected concurrent modification.
-      ROLLBACK
-      Log error: "Child row I has status <existing> but intended <outcome>"
-      result: INCONSISTENT
+      ROLLBACK → INCONSISTENT (status mismatch)
 ```
 
 **Key properties:**
-- Child UPDATE and parent counter UPDATE are in the **same transaction**. If the parent UPDATE fails (fencing or other error), ROLLBACK undoes both.
-- When child UPDATE returns 0 rows, the existing status is read and verified. Silent acceptance of any zero-row result is never permitted.
-- `ALREADY_WRITTEN` result means the loop continues safely (no double-counting).
-- `INCONSISTENT` result means the loop enters INTERRUPTED state.
-
-### §7.4. T1, T2, T3 independence
-
-T1, T2, and T3 are three independent committed transactions on the same SQLAlchemy session. Between each, the session is clean (committed or rolled back). The SQLAlchemy session's `autoflush=False` and `expire_on_commit=False` settings ensure no surprise flushes or state expirations.
-
-### §7.5. Crash-window analysis (every transaction boundary)
-
-| # | Crash point | Child-row state | Audit exists? | Parent counter updated? | Recovery path |
-|---|---|---|---|---|---|
-| CW1 | After upload INSERT, before COMMIT | — | No | — | Upload failed; client retries. No session exists. |
-| CW2 | After upload COMMIT | — | Yes (uploaded) | — | Normal flow continues. |
-| CW3 | After confirm UPDATE, before import loop starts | — | Yes (confirmed) | — | Session PROCESSING, heartbeat stale → reconcile (0 rows processed, all NOT_PROCESSED). |
-| CW4 | T1 INSERT committed, ACK lost | STARTED | No | heartbeat updated | App gets connection error → INTERRUPTED → after-loop fails (broken session) → session stays PROCESSING → reconcile: STARTED + no audit → NOT_PROCESSED. |
-| CW5 | After T1 COMMIT, before T2 starts | STARTED | No | heartbeat updated | INTERRUPTED → after-loop inserts NOT_PROCESSED for unstarted rows, leaves STARTED → reconcile: STARTED + no audit → NOT_PROCESSED. |
-| CW6 | During T2, before its COMMIT | STARTED | No | heartbeat from T1 | Same as CW5. T2 rolls back (no student). |
-| CW7 | T2 COMMIT sent, ACK lost | STARTED | Maybe | heartbeat from T1 | App doesn't know if committed. persist_uncertain() may fail. INTERRUPTED → reconcile: if audit → SUCCEEDED; if no audit → NOT_PROCESSED (was_attempted=NULL). |
-| CW8 | After T2 COMMIT (success), before T3 | STARTED | Yes | heartbeat from T1 | INTERRUPTED → after-loop leaves STARTED → reconcile: STARTED + audit → SUCCEEDED. |
-| CW9 | After T2 ROLLBACK (business error), before T3 | STARTED | No | heartbeat from T1 | INTERRUPTED → after-loop leaves STARTED → reconcile: STARTED + no audit → NOT_PROCESSED (was_attempted=NULL). Lost error details are irrecoverable. |
-| CW10 | T3 child+parent UPDATE committed, ACK lost | Final status | Yes (if SUCCEEDED) | Yes | App gets error. Session may be broken → INTERRUPTED → after-loop: T1 for next row would see existing final child row → SKIP. Or if loop breaks: reconcile uses child-row status as-is. |
-| CW11 | After T3 COMMIT | Final status | Matches | Yes | Normal flow. |
-| CW12 | After all rows, before after-loop runs | All children final or STARTED | Per-row | Per-row | INTERRUPTED (if loop broke) or NORMAL. After-loop or reconcile handles. |
-| CW13 | After-loop transaction committed, ACK lost | Children classified | Audit maybe | Counters maybe | If committed: session is terminal or PROCESSING with interrupted audit. If not: reconcile handles. |
-| CW14 | Terminal write COMMIT sent, ACK lost | All final | All present | All counted | If committed: session is terminal, validated_rows scrubbed. If not: session stays PROCESSING → reconcile. |
+- Child UPDATE + parent counter UPDATE in same transaction. Parent failure → both rolled back.
+- Zero-row child UPDATE → read existing status → verify consistency. Never silently ignored.
 
 ---
 
@@ -638,360 +488,326 @@ T1, T2, and T3 are three independent committed transactions on the same SQLAlche
 ```
 bulk_upload_sessions (FOR SHARE)  ← only when bulk_origin provided
   → term (FOR SHARE)
-    → department (FOR SHARE)
-      → program (FOR SHARE)
-        → section (FOR SHARE)
-          → student (FOR UPDATE)       ← correction only
-            → placement (FOR UPDATE)   ← correction only
+    → department/program/section (FOR SHARE)
+      → student/placement (FOR UPDATE, correction only)
 ```
 
-No existing code locks `bulk_upload_sessions` (new table). Reconciliation's UPDATE acquires an exclusive lock on `bulk_upload_sessions` only. No cycle is possible.
-
 ### §8.2. FOR SHARE inside register_student()
-
-New parameter: `bulk_origin: BulkImportOrigin | None = None`.
 
 ```python
 @dataclass(frozen=True)
 class BulkImportOrigin:
     upload_session_id: uuid.UUID
-    row_index: int  # valid_row_index, for audit metadata
+    row_index: int  # valid_row_index
 ```
 
-Inside the first try block of `register_student()`, before `_lock_and_validate()`:
+Before `_lock_and_validate()`:
 
 ```python
 if bulk_origin is not None:
     session_status = self.db.scalar(
         select(BulkUploadSession.status)
         .where(BulkUploadSession.id == bulk_origin.upload_session_id)
-        .with_for_update(read=True)  # FOR SHARE
+        .with_for_update(read=True)
     )
     if session_status != BulkUploadStatus.PROCESSING.value:
-        raise BulkImportSessionFencedError(
-            "Import session is no longer active."
-        )
+        raise BulkImportSessionFencedError(...)
 ```
 
-Lock is held until `self.db.commit()` (line 309) or `self.db.rollback()` (lines 248, 311, 322).
+**Interaction with reconciliation's exclusive lock:**
+- If reconciliation holds the exclusive lock → FOR SHARE blocks until reconciliation commits (terminal) or rolls back (PROCESSING).
+- After commit: FOR SHARE reads terminal → `BulkImportSessionFencedError` → no student.
+- After rollback: FOR SHARE reads PROCESSING → registration proceeds → audit visible for future reconciliation.
 
-### §8.3. Fencing invariant
-
-No student can be committed after reconciliation claims the session without reconciliation seeing the audit record.
-
-**Case 1 — Registration commits first:** FOR SHARE acquired → reconciliation's claim UPDATE blocks (FOR SHARE and UPDATE are incompatible at the row level in PostgreSQL). After registration commits, lock released, audit visible. Reconciliation proceeds and sees the audit record.
-
-**Case 2 — Reconciliation claims first:** Reconciliation's claim UPDATE acquires an implicit exclusive lock on the session row. The registration's FOR SHARE blocks until reconciliation commits. After reconciliation commits (session is terminal), FOR SHARE reads the terminal status → `BulkImportSessionFencedError` → rollback → no student created.
-
-**Case 3 — Connection lost:** PostgreSQL rolls back the transaction holding the lock → lock released. No student committed if registration hadn't reached its COMMIT; reconciliation proceeds normally.
+**Interaction with after-loop's exclusive lock:** Same mechanism. After-loop holds exclusive lock → FOR SHARE blocks → after commit, reads current status → proceeds or raises fencing error accordingly.
 
 ---
 
-## §9. Import-Loop State Machine, Exception Handling, and After-Loop Algorithm
+## §9. Import-Loop State Machine, After-Loop Ownership, and Exception Boundaries
 
-### §9.1. `BulkImportSessionFencedError`
-
-```python
-class BulkImportSessionFencedError(StudentServiceError):
-    """Raised when the bulk upload session is no longer PROCESSING.
-    NOT a subclass of StudentConflictError — must not be caught
-    by the business-error handler in the import loop."""
-```
-
-### §9.2. ImporterState enum
+### §9.1. ImporterState enum
 
 ```python
 class ImporterState(StrEnum):
-    NORMAL = "NORMAL"           # processing rows
-    FENCED = "FENCED"           # session claimed by reconciliation
-    INTERRUPTED = "INTERRUPTED" # unexpected error, cannot continue
+    NORMAL = "NORMAL"
+    FENCED = "FENCED"
+    INTERRUPTED = "INTERRUPTED"
 ```
 
-### §9.3. Import loop with explicit state transitions
+### §9.2. Import loop with separated exception boundaries (correction 4)
 
 ```python
 importer_state = ImporterState.NORMAL
 
 for vr in valid_rows:
     index = vr["valid_row_index"]
-    csv_record = vr["csv_record_number"]
+    csv_rec = vr["csv_record_number"]
 
-    # ── T1: STARTED ──
-    t1_result = persist_started(db, session_id, index, csv_record)
-
-    if t1_result == T1Result.FENCED:
-        importer_state = ImporterState.FENCED
-        break
-
-    if t1_result == T1Result.SKIP:
-        # Child row already exists. Do not process.
+    # ── T1 ──
+    t1 = persist_started(db, session_id, index, csv_rec)
+    if t1 == T1Result.FENCED:
+        importer_state = ImporterState.FENCED; break
+    if t1 == T1Result.SKIP:
         continue
 
-    # t1_result == T1Result.PROCEED — fresh child row created
-
+    # ── T2: Registration (separate try) ──
+    reg_result = None
+    reg_error = None
     try:
-        result = student_service.register_student(
+        reg_result = student_service.register_student(
             actor=actor, department_id=department_id,
             data=make_registration_data(vr),
             ip_address=ip_address,
             bulk_origin=BulkImportOrigin(session_id, index),
         )
-
-        # ── T3: SUCCEEDED ──
-        t3_result = persist_outcome(
-            db, session_id, index,
-            outcome=RowOutcome.SUCCEEDED,
-            student_id=result.student.id,
-            first_name=result.user.first_name,
-            last_name=result.user.last_name,
-            roll_number=result.student.roll_number,
-        )
-
-        if t3_result == T3Result.FENCED:
-            importer_state = ImporterState.FENCED
-            break
-        if t3_result == T3Result.INCONSISTENT:
-            importer_state = ImporterState.INTERRUPTED
-            break
-
-        schedule_email(background_tasks, ...)
-
     except BulkImportSessionFencedError:
-        importer_state = ImporterState.FENCED
-        break
-
+        importer_state = ImporterState.FENCED; break
     except (StudentConflictError, StudentValidationError,
             StudentReferenceNotFoundError) as exc:
-
-        # ── T3: FAILED ──
-        t3_result = persist_outcome(
-            db, session_id, index,
-            outcome=RowOutcome.FAILED,
-            error_code=classify_error(exc),
-            error_message=str(exc),
-            corrective_action=suggest_correction(exc),
-            is_retryable=is_retryable(exc),
-            first_name=vr.get("first_name"),
-            last_name=vr.get("last_name"),
-            roll_number=vr.get("roll_number"),
-        )
-
-        if t3_result == T3Result.FENCED:
-            importer_state = ImporterState.FENCED
-            break
-        if t3_result == T3Result.INCONSISTENT:
-            importer_state = ImporterState.INTERRUPTED
-            break
-
+        reg_error = exc
     except Exception:
-        # ── T3: OUTCOME_UNCERTAIN ──
+        # Unexpected T2 failure. Student may or may not exist.
         try:
-            persist_outcome(
-                db, session_id, index,
+            persist_outcome(db, session_id, index,
                 outcome=RowOutcome.OUTCOME_UNCERTAIN,
+                first_name=vr.get("first_name"), ...)
+        except Exception:
+            pass  # child stays STARTED
+        importer_state = ImporterState.INTERRUPTED; break
+
+    # ── T3: outcome persistence (separate try) ──
+    if reg_result is not None:
+        # T2 succeeded — persist SUCCEEDED
+        try:
+            t3 = persist_outcome(db, session_id, index,
+                outcome=RowOutcome.SUCCEEDED,
+                student_id=reg_result.student.id,
+                first_name=reg_result.user.first_name,
+                last_name=reg_result.user.last_name,
+                roll_number=reg_result.student.roll_number)
+        except Exception:
+            # T3 failed. Student IS registered (T2 committed).
+            # Child stays STARTED. Reconciliation: audit → SUCCEEDED.
+            importer_state = ImporterState.INTERRUPTED; break
+
+        if t3 == T3Result.FENCED:
+            # Parent UPDATE returned 0. ROLLBACK undid child update.
+            # Student IS registered. Reconciliation finds audit.
+            importer_state = ImporterState.FENCED; break
+        if t3 == T3Result.INCONSISTENT:
+            importer_state = ImporterState.INTERRUPTED; break
+
+        # ── Email (separate try — failure is non-fatal) ──
+        try:
+            schedule_email(background_tasks, email_sender,
+                build_student_onboarding_email(
+                    to=reg_result.user.email,
+                    first_name=reg_result.user.first_name,
+                    program_name=reg_result.program.name,
+                    department_name=reg_result.department.name))
+        except Exception:
+            logger.warning("Email scheduling failed for row %d", index)
+        # Continue to next row regardless of email outcome.
+
+    elif reg_error is not None:
+        # T2 raised business error — persist FAILED
+        try:
+            t3 = persist_outcome(db, session_id, index,
+                outcome=RowOutcome.FAILED,
+                error_code=classify_error(reg_error),
+                error_message=str(reg_error),
+                corrective_action=suggest_correction(reg_error),
+                is_retryable=is_retryable(reg_error),
                 first_name=vr.get("first_name"),
                 last_name=vr.get("last_name"),
-                roll_number=vr.get("roll_number"),
-            )
+                roll_number=vr.get("roll_number"))
         except Exception:
-            pass  # child row stays STARTED; reconciliation handles it
-        importer_state = ImporterState.INTERRUPTED
-        break
+            # T3 failed. T2 rolled back (no student).
+            # Child stays STARTED. Reconciliation: no audit → NOT_PROCESSED.
+            importer_state = ImporterState.INTERRUPTED; break
+
+        if t3 == T3Result.FENCED:
+            importer_state = ImporterState.FENCED; break
+        if t3 == T3Result.INCONSISTENT:
+            importer_state = ImporterState.INTERRUPTED; break
 ```
 
-### §9.4. After-loop algorithm (all three states)
+**Exception boundary summary:**
 
-**This is the corrected algorithm that never reclassifies STARTED rows.**
+| Failure | Outcome | Email? | Loop? |
+|---------|---------|--------|-------|
+| T2 business error | FAILED (T3) | No | Continues |
+| T2 unexpected error | OUTCOME_UNCERTAIN or STARTED | No | Breaks (INTERRUPTED) |
+| T2 fencing | Child stays STARTED | No | Breaks (FENCED) |
+| T3 exception (after T2 success) | Child stays STARTED; student IS registered | No | Breaks (INTERRUPTED) |
+| T3 FENCED (after T2 success) | Child stays STARTED; student IS registered | No | Breaks (FENCED) |
+| T3 exception (after T2 error) | Child stays STARTED; no student | No | Breaks (INTERRUPTED) |
+| Email failure (after T3 SUCCEEDED) | SUCCEEDED (unchanged) | Attempted, failed | Continues |
+
+### §9.3. After-loop ownership model (correction 1)
+
+The after-loop acquires an exclusive lock on the session row before any child mutations. This prevents concurrent reconciliation from modifying children at the same time.
+
+**Complete after-loop algorithm:**
 
 ```python
 if importer_state == ImporterState.FENCED:
-    # ═══ FENCED ═══
-    # Session is in RECONCILING (or about to be claimed).
-    # Do NOT classify any remaining rows.
-    # Do NOT write terminal status.
-    # Do NOT write any audit events.
-    # Leave everything for the reconciler.
+    # Session is being claimed by reconciliation.
+    # Do NOT classify remaining rows. Do NOT write audit. Leave everything.
     pass
 
 elif importer_state in (ImporterState.NORMAL, ImporterState.INTERRUPTED):
-    # ═══ NORMAL or INTERRUPTED ═══
-
     try:
-        # Step 1: Find valid_row_indexes with NO child row at all.
-        # These are rows the import loop never reached (never started).
-        # They can safely be classified as NOT_PROCESSED.
-        existing_indexes = set(
-            db.scalars(
-                select(BulkUploadRowResult.valid_row_index)
-                .where(BulkUploadRowResult.upload_session_id == session_id)
-            ).all()
-        )
-        all_indexes = set(range(1, valid_count + 1))
-        never_started_indexes = all_indexes - existing_indexes
+        # ── Step 0: Acquire ownership ──
+        db.execute(text("SET LOCAL lock_timeout = '5s'"))
 
-        # Step 2: Insert NOT_PROCESSED child rows for never-started indexes.
-        for mi in sorted(never_started_indexes):
-            csv_rec = index_to_csv_record[mi]  # from in-memory mapping
+        ownership_rowcount = db.execute(
+            update(BulkUploadSession)
+            .where(BulkUploadSession.id == session_id)
+            .where(BulkUploadSession.status == 'PROCESSING')
+            .values(processing_heartbeat_at=func.now(),
+                    updated_at=func.now())
+        ).rowcount
+
+        if ownership_rowcount == 0:
+            # Session no longer PROCESSING (reconciliation committed
+            # terminal, or some other state change).
+            db.rollback()
+            return  # Leave everything to reconciliation.
+
+        # Exclusive lock now held. No reconciliation can claim
+        # until this transaction commits or rolls back.
+
+        # ── Step 1: Find rows with NO child record ──
+        existing_indexes = set(db.scalars(
+            select(BulkUploadRowResult.valid_row_index)
+            .where(BulkUploadRowResult.upload_session_id == session_id)
+        ).all())
+        all_indexes = set(range(1, valid_count + 1))
+        never_started = all_indexes - existing_indexes
+
+        # ── Step 2: Insert NOT_PROCESSED for never-started ──
+        for mi in sorted(never_started):
+            csv_rec = index_to_csv_record[mi]
             db.execute(
-                insert(BulkUploadRowResult).values(
+                pg_insert(BulkUploadRowResult).values(
                     upload_session_id=session_id,
                     valid_row_index=mi,
                     csv_record_number=csv_rec,
-                    status=RowOutcome.NOT_PROCESSED.value,
-                    was_attempted=False,
-                )
+                    status='NOT_PROCESSED',
+                    was_attempted=False)
             )
 
-        # Step 3: Count unresolved rows (STARTED or OUTCOME_UNCERTAIN).
-        unresolved_count = db.scalar(
-            select(func.count())
+        # ── Step 3: Recalculate ALL counters from child table ──
+        counts = dict(db.execute(
+            select(BulkUploadRowResult.status, func.count())
             .where(BulkUploadRowResult.upload_session_id == session_id)
-            .where(BulkUploadRowResult.status.in_([
-                RowOutcome.STARTED.value,
-                RowOutcome.OUTCOME_UNCERTAIN.value,
-            ]))
-        )
+            .group_by(BulkUploadRowResult.status)
+        ).all())
 
-        if unresolved_count > 0:
-            # Step 4a: STARTED or OUTCOME_UNCERTAIN rows remain.
-            # Do NOT terminalize. Session stays PROCESSING.
-            # Record the interrupted audit event in this transaction.
+        succeeded = counts.get('SUCCEEDED', 0)
+        failed = counts.get('FAILED', 0)
+        not_processed = counts.get('NOT_PROCESSED', 0)
+        uncertain = counts.get('OUTCOME_UNCERTAIN', 0)
+        started = counts.get('STARTED', 0)
+        unresolved = uncertain + started
+
+        # ── Step 4: Terminal or interrupted ──
+        if unresolved > 0:
+            # 4a: Unresolved rows remain. No terminal write.
+            parent_rowcount = db.execute(
+                update(BulkUploadSession)
+                .where(BulkUploadSession.id == session_id)
+                .where(BulkUploadSession.status == 'PROCESSING')
+                .values(
+                    imported_count=succeeded,
+                    failed_count=failed,
+                    not_processed_count=not_processed,
+                    uncertain_count=uncertain + started,
+                    updated_at=func.now())
+            ).rowcount
+            if parent_rowcount == 0:
+                db.rollback(); return
+
             audit_service.record(
                 action=AuditAction.BULK_IMPORT_INTERRUPTED,
                 entity_type=AuditEntityType.BULK_UPLOAD_SESSION,
                 entity_id=session_id,
                 actor_user_id=actor.id,
-                metadata={
-                    "unresolved_count": unresolved_count,
-                    "imported_count": current_imported,
-                    "failed_count": current_failed,
-                },
-                ip_address=ip_address,
-            )
-            # Update counters to reflect the NOT_PROCESSED inserts,
-            # but do NOT clear uncertain_count or write terminal status.
-            db.execute(
-                update(BulkUploadSession)
-                .where(BulkUploadSession.id == session_id)
-                .where(BulkUploadSession.status == BulkUploadStatus.PROCESSING.value)
-                .values(
-                    not_processed_count=len(never_started_indexes)
-                        + current_not_processed,
-                    updated_at=func.now(),
-                )
-            )
+                metadata={"unresolved_count": unresolved,
+                          "imported_count": succeeded,
+                          "failed_count": failed},
+                ip_address=ip_address)
             db.commit()
-            # Session stays PROCESSING. Heartbeat goes stale.
-            # Reconciliation resolves STARTED/OUTCOME_UNCERTAIN rows.
 
         else:
-            # Step 4b: All rows have definitive outcomes (no STARTED, no UNCERTAIN).
-            # Verify total count matches valid_count.
-            definitive_count = db.scalar(
-                select(func.count())
-                .where(BulkUploadRowResult.upload_session_id == session_id)
-                .where(BulkUploadRowResult.status.in_([
-                    RowOutcome.SUCCEEDED.value,
-                    RowOutcome.FAILED.value,
-                    RowOutcome.NOT_PROCESSED.value,
-                ]))
-            )
-            if definitive_count != valid_count:
-                # Count mismatch — do not terminalize.
-                db.rollback()
-                # Session stays PROCESSING → reconciliation.
-            else:
-                # Recalculate counters from child table.
-                counts = recalculate_counts(db, session_id)
-                terminal_status = determine_terminal_status(counts)
-                db.execute(
-                    update(BulkUploadSession)
-                    .where(BulkUploadSession.id == session_id)
-                    .where(BulkUploadSession.status ==
-                           BulkUploadStatus.PROCESSING.value)
-                    .values(
-                        status=terminal_status.value,
-                        imported_count=counts.succeeded,
-                        failed_count=counts.failed,
-                        not_processed_count=counts.not_processed,
-                        uncertain_count=0,
-                        validated_rows=text("'[]'::jsonb"),
-                        completed_at=func.now(),
-                        updated_at=func.now(),
-                    )
-                )
-                audit_service.record(
-                    action=AuditAction.BULK_IMPORT_COMPLETED,
-                    entity_type=AuditEntityType.BULK_UPLOAD_SESSION,
-                    entity_id=session_id,
-                    actor_user_id=actor.id,
-                    metadata={"status": terminal_status.value, **counts._asdict()},
-                    ip_address=ip_address,
-                )
-                db.commit()
+            # 4b: All rows definitive. Verify count.
+            total = succeeded + failed + not_processed
+            if total != valid_count:
+                db.rollback(); return  # Inconsistent → reconciliation.
+
+            terminal = determine_terminal_status(succeeded, valid_count)
+            parent_rowcount = db.execute(
+                update(BulkUploadSession)
+                .where(BulkUploadSession.id == session_id)
+                .where(BulkUploadSession.status == 'PROCESSING')
+                .values(
+                    status=terminal,
+                    imported_count=succeeded,
+                    failed_count=failed,
+                    not_processed_count=not_processed,
+                    uncertain_count=0,
+                    validated_rows=text("'[]'::jsonb"),
+                    completed_at=func.now(),
+                    updated_at=func.now())
+            ).rowcount
+            if parent_rowcount == 0:
+                db.rollback(); return
+
+            audit_service.record(
+                action=AuditAction.BULK_IMPORT_COMPLETED,
+                entity_type=AuditEntityType.BULK_UPLOAD_SESSION,
+                entity_id=session_id,
+                actor_user_id=actor.id,
+                metadata={"status": terminal,
+                          "imported_count": succeeded,
+                          "failed_count": failed,
+                          "not_processed_count": not_processed},
+                ip_address=ip_address)
+            db.commit()
 
     except Exception:
-        # After-loop itself failed (e.g., DB connection lost).
-        # Nothing is committed. Session stays PROCESSING.
-        # get_db()'s finally: db.close() cleans up.
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        # Session stays PROCESSING → heartbeat stale → reconciliation.
+        try: db.rollback()
+        except Exception: pass
+        # Session stays PROCESSING → reconciliation.
 ```
 
-**Critical safety properties of this algorithm:**
+**Ownership-conflict proof (after-loop vs. reconciliation):**
 
-1. **STARTED rows are never reclassified.** Step 2 only inserts for `never_started_indexes` (indexes with NO child row at all). Existing STARTED rows are untouched.
-2. **STARTED rows block terminalization.** Step 3 counts STARTED and OUTCOME_UNCERTAIN rows. If `unresolved_count > 0`, step 4a runs: no terminal status, session stays PROCESSING.
-3. **Terminal write is conditional on completeness.** Step 4b verifies `definitive_count == valid_count` before writing terminal status.
-4. **After-loop failure is safe.** If the try block fails, nothing is committed. Session stays PROCESSING with stale heartbeat.
+| Scenario | After-loop | Reconciliation | Outcome |
+|---|---|---|---|
+| After-loop acquires lock first | Proceeds; commits | Blocks on row lock → after commit, sees terminal or fresh heartbeat → 0 rows or timeout → 409 or 503 | After-loop wins. |
+| Reconciliation acquires lock first | Blocks on row lock → after reconciliation commits (terminal), `WHERE status='PROCESSING'` matches 0 → ownership_rowcount=0 → returns | Proceeds; commits terminal | Reconciliation wins. |
+| Reconciliation acquires lock, then rolls back (contradiction) | Unblocked; sees PROCESSING with stale heartbeat → ownership_rowcount=1 → proceeds | Rolled back; no changes persisted | After-loop wins. |
+| After-loop lock_timeout fires | Rolls back; session stays PROCESSING → reconciliation later | Proceeds eventually | Reconciliation wins. |
 
-### §9.5. Behavior when database connection is unavailable
+**At no point do both commit child mutations.** The exclusive row lock serializes them.
 
-If the connection is lost mid-import:
+### §9.4. Broken session / connection loss
 
-1. The current transaction (T1, T2, or T3) fails with a connection error.
-2. The importer catches it as an unexpected exception → `importer_state = INTERRUPTED`.
-3. The after-loop attempts to run but all DB operations fail (no connection).
-4. The `except Exception` at the end of the after-loop catches the failure.
-5. `db.rollback()` may also fail (no connection) — caught and ignored.
-6. `get_db()`'s `finally: db.close()` runs, releasing the broken connection.
-7. The confirm endpoint returns 500 (the connection error propagates).
-8. The session stays PROCESSING with stale heartbeat.
-9. Reconciliation (triggered by a future request on a healthy connection) resolves all rows.
+If the db connection is unavailable: all after-loop operations fail → `except Exception` → rollback (may also fail) → session stays PROCESSING with stale heartbeat → reconciliation.
 
-### §9.6. Behavior when the SQLAlchemy session cannot be reused
-
-If a failed rollback puts the session in an error state:
-
-1. Any subsequent `db.execute()` or `db.scalar()` raises `InvalidRequestError`.
-2. The importer enters INTERRUPTED and breaks immediately.
-3. The after-loop attempts to run but every DB call raises `InvalidRequestError`.
-4. The `except Exception` catches everything.
-5. `get_db()`'s `finally: db.close()` cleans up the session object.
-6. Session stays PROCESSING with stale heartbeat → reconciliation.
-
-**Key safety property:** A broken import loop can never leave the system in an inconsistent state. The worst case is "session stuck in PROCESSING with stale heartbeat," which reconciliation handles.
+If the SQLAlchemy session is in error state: same path. `get_db()`'s `finally: db.close()` cleans up.
 
 ---
 
-## §10. Reconciliation: Single-Transaction Ownership Model
+## §10. Reconciliation: Single-Transaction Model with Contradiction Handling
 
-### §10.1. Transaction strategy
+### §10.1. Transaction structure
 
-The entire reconciliation — claim, child-row reads, audit query, child-row mutations, counter recalculation, terminal write, `validated_rows` scrubbing, and audit — runs in a **single database transaction**.
+The entire reconciliation — claim, reads, classifications, child mutations, counter recalculation, terminal write, scrubbing, and audit — runs in a **single database transaction**. The claim UPDATE's implicit exclusive row lock is held until COMMIT/ROLLBACK.
 
-The claim UPDATE implicitly acquires a **row-level exclusive lock** on the `bulk_upload_sessions` row. This lock is held until COMMIT or ROLLBACK. While held:
-
-- No other reconciler's claim UPDATE can proceed (it blocks on the row lock).
-- The import loop's FOR SHARE on the same row also blocks (FOR SHARE and exclusive lock are incompatible).
-- After this transaction commits (session is terminal), any blocked FOR SHARE reads the terminal status and raises `BulkImportSessionFencedError`.
-
-The `reconciliation_claim_token` remains as **defense-in-depth** on the final terminal UPDATE. In practice, the row lock prevents concurrent claims, but the token guards against implementation bugs.
-
-### §10.2. Claim (within the single transaction)
+### §10.2. Claim
 
 ```sql
 BEGIN;
@@ -1004,85 +820,98 @@ SET status = 'RECONCILING',
     reconciliation_claim_token = :new_token,
     updated_at = now()
 WHERE id = :upload_id
-  AND (
-    (status = 'PROCESSING'
-     AND processing_heartbeat_at < now() - INTERVAL '5 minutes')
-    OR
-    (status = 'RECONCILING'
-     AND reconciliation_started_at < now() - INTERVAL '5 minutes')
-  )
+  AND status = 'PROCESSING'
+  AND processing_heartbeat_at < now() - INTERVAL '5 minutes'
 RETURNING id, reconciliation_claim_token, valid_count;
 ```
 
-`:new_token` = `uuid.uuid4()` generated per claim.
+Lock timeout → ROLLBACK → 503. Zero rows → ROLLBACK → 409.
 
-Lock timeout hit → ROLLBACK, return 503. 0 rows → ROLLBACK, return 409.
+**No stale RECONCILING reclaim.** The WHERE clause checks only `status='PROCESSING'`. Under the single-transaction model, RECONCILING is never committed. If a reconciliation transaction rolls back, the session reverts to PROCESSING with stale heartbeat, and this same check succeeds on the next attempt.
 
-### §10.3. Algorithm (same transaction continues)
+### §10.3. Read phase (same transaction)
 
-**Step 1 — Read child rows:**
-
+**Step 1 — Child rows:**
 ```sql
 SELECT valid_row_index, status, student_id
 FROM bulk_upload_row_results
 WHERE upload_session_id = :upload_id;
 ```
 
-Build a map: `{valid_row_index → (status, student_id)}`.
+**Step 2 — `validated_rows`** for `valid_row_index → csv_record_number` mapping.
 
-**Step 2 — Read `validated_rows`** (not yet scrubbed) for the `valid_row_index → csv_record_number` mapping.
-
-**Step 3 — Query audit records:**
-
+**Step 3 — Audit records:**
 ```sql
 SELECT entity_id,
-       (event_metadata->>'bulk_upload_row_number')::integer AS row_index
+       event_metadata->>'bulk_upload_valid_row_index' AS raw_index,
+       event_metadata->>'bulk_upload_session_id' AS raw_session_id
 FROM audit_logs
 WHERE action = 'student.registered'
   AND event_metadata->>'bulk_upload_session_id' = :upload_id_text;
 ```
 
-Build a map: `{row_index → entity_id (student_id)}`.
+For each returned row, validate:
+- `raw_index` is not NULL and parses as a positive integer.
+- `raw_session_id` matches `:upload_id_text`.
+- `entity_id` is not NULL.
+- No duplicate `row_index` values.
 
-**Step 4 — Classify every valid row** (index 1..valid_count):
+If any validation fails → contradiction (§10.4).
 
-| Child-row state | Audit record? | Classification | `was_attempted` |
+Build maps: `audit_by_index: {row_index → entity_id}`, `child_by_index: {row_index → (status, student_id)}`.
+
+### §10.4. Complete reconciliation decision table (correction 2)
+
+**Normal cases (consistent evidence):**
+
+| Child status | Audit? | Action | `was_attempted` |
 |---|---|---|---|
-| SUCCEEDED | Verify present | SUCCEEDED (keep) | TRUE (keep) |
-| FAILED | Verify absent | FAILED (keep) | TRUE (keep) |
-| NOT_PROCESSED | Verify absent | NOT_PROCESSED (keep) | Keep existing |
-| OUTCOME_UNCERTAIN | Yes | → SUCCEEDED | TRUE |
-| OUTCOME_UNCERTAIN | No | → NOT_PROCESSED | NULL |
-| STARTED | Yes | → SUCCEEDED | TRUE |
-| STARTED | No | → NOT_PROCESSED | NULL |
-| No child row | Yes | Create SUCCEEDED row | TRUE |
-| No child row | No | Create NOT_PROCESSED row | FALSE |
+| None | No | INSERT NOT_PROCESSED | FALSE |
+| None | Yes | INSERT SUCCEEDED (student_id from audit) | TRUE |
+| STARTED | No | UPDATE → NOT_PROCESSED | NULL |
+| STARTED | Yes | UPDATE → SUCCEEDED (student_id from audit) | TRUE |
+| OUTCOME_UNCERTAIN | No | UPDATE → NOT_PROCESSED | TRUE (keep) |
+| OUTCOME_UNCERTAIN | Yes | UPDATE → SUCCEEDED (student_id from audit) | TRUE (keep) |
+| SUCCEEDED | Yes, entity_id matches child student_id | Keep | TRUE (keep) |
+| FAILED | No | Keep | TRUE (keep) |
+| NOT_PROCESSED | No | Keep | Keep existing |
 
-**Step 5 — Apply changes** (all within the same transaction):
+**Contradictory cases (fail closed — reconciliation ROLLS BACK):**
 
-- **Update child rows** where classification changed (STARTED → SUCCEEDED, OUTCOME_UNCERTAIN → NOT_PROCESSED, etc.).
-- **Insert child rows** for indexes that had no child row.
+| Case | Child status | Audit status | Classification |
+|---|---|---|---|
+| C1 | SUCCEEDED | No audit for this index | CONTRADICTION |
+| C2 | FAILED | Audit exists for this index | CONTRADICTION |
+| C3 | NOT_PROCESSED | Audit exists for this index | CONTRADICTION |
+| C4 | SUCCEEDED | Audit exists but `entity_id ≠ child.student_id` | CONTRADICTION |
+| C5 | Any | Multiple audit records for same index | CONTRADICTION |
+| C6 | Any | Audit `raw_index` not parseable as integer | CONTRADICTION |
+| C7 | Any | Audit `raw_index` is NULL | CONTRADICTION |
 
-**Step 6 — Recalculate counters** from child table:
+**On any contradiction:**
 
-```sql
-SELECT status, COUNT(*)
-FROM bulk_upload_row_results
-WHERE upload_session_id = :upload_id
-GROUP BY status;
-```
+1. The reconciliation transaction ROLLS BACK. The claim (RECONCILING) and all child-row mutations are undone. The session reverts to PROCESSING.
+2. The endpoint returns 409 with a detailed error response listing each contradiction: `{"contradictions": [{"valid_row_index": 5, "type": "SUCCEEDED_NO_AUDIT", "details": "..."}]}`.
+3. The admin investigates the audit_logs and child table directly (requires database access).
+4. After manual correction, the admin retries reconciliation.
 
-Verify: total count = valid_count. No STARTED or OUTCOME_UNCERTAIN rows remain.
+**Rationale:** Contradictions indicate data integrity issues (bugs or manual intervention). Terminalizing with contradictory evidence would permanently record incorrect results. Rolling back is safe — the session reverts to its prior state, and no incorrect data is committed.
 
-**Step 7 — Terminal write with ownership token (defense-in-depth):**
+### §10.5. Write phase (same transaction, only if no contradictions)
+
+**Step 5 — Apply changes:** Update child rows where classification changed. Insert child rows for missing indexes.
+
+**Step 6 — Recalculate counters** from child table (same query as after-loop step 3).
+
+**Step 7 — Verify:** `total = succeeded + failed + not_processed`. Verify `total == valid_count` and no STARTED/UNCERTAIN remain. If not → ROLLBACK (should not happen if decision table is correct).
+
+**Step 8 — Terminal write (defense-in-depth token):**
 
 ```sql
 UPDATE bulk_upload_sessions
 SET status = :terminal,
-    imported_count = :c1,
-    failed_count = :c2,
-    not_processed_count = :c3,
-    uncertain_count = 0,
+    imported_count = :c1, failed_count = :c2,
+    not_processed_count = :c3, uncertain_count = 0,
     validated_rows = '[]',
     completed_at = now(),
     was_reconciled = TRUE,
@@ -1093,576 +922,409 @@ WHERE id = :upload_id
 RETURNING id;
 ```
 
-0 rows → data inconsistency (should not happen with single-transaction model). Log error, ROLLBACK.
+0 rows → ROLLBACK (should not happen — this transaction set RECONCILING and holds the lock).
 
-**Step 8 — Audit record:**
+**Step 9 — Audit:** `bulk_import.reconciled` via `AuditService.record()` (flush).
 
-```python
-audit_service.record(
-    action=AuditAction.BULK_IMPORT_RECONCILED,
-    entity_type=AuditEntityType.BULK_UPLOAD_SESSION,
-    entity_id=session_id,
-    actor_user_id=actor.id,
-    metadata={...},
-    ip_address=ip_address,
-)
-```
+**Step 10 — COMMIT.** All child mutations, counters, terminal status, scrubbing, and audit committed atomically.
 
-**Step 9 — COMMIT.**
+### §10.6. Interaction with concurrent after-loop
 
-All child-row mutations, counter updates, terminal status, `validated_rows` scrubbing, and audit record are committed atomically. If COMMIT fails, everything rolls back. The session reverts to its pre-claim state (PROCESSING or previous RECONCILING), and the row lock is released.
+The after-loop also acquires an exclusive lock on the session row (§9.3 step 0). The row lock serializes the two operations:
 
-### §10.4. Why a single transaction prevents stale-reconciler mutations
+| After-loop first | Reconciliation blocks → after-loop commits → reconciliation sees terminal or fresh heartbeat → 0 rows |
+|---|---|
+| Reconciliation first | After-loop blocks → reconciliation commits terminal → after-loop sees `status ≠ 'PROCESSING'` → returns |
+| Reconciliation first, then rolls back (contradiction) | After-loop unblocked → sees PROCESSING → proceeds |
 
-**Scenario:** Reconciler A claims first, reconciler B tries to re-claim.
-
-1. A's transaction begins. A's claim UPDATE acquires exclusive row lock on the session row.
-2. B's claim UPDATE blocks on the row lock.
-3. B waits up to 10 seconds (`lock_timeout`).
-
-**Case A finishes first (within 10s):**
-4. A commits → session is now terminal (COMPLETED/PARTIALLY_COMPLETED/FAILED) → row lock released.
-5. B's UPDATE proceeds. The WHERE clause checks `status = 'PROCESSING' AND heartbeat stale OR status = 'RECONCILING' AND started stale`. Session is now terminal → neither condition matches → 0 rows → B returns 409.
-6. **B has never modified any child rows.** B's entire transaction consisted of one blocked UPDATE that matched nothing.
-
-**Case A is slow (B times out):**
-4. B's lock_timeout expires → B gets an error → B returns 503 → B's transaction rolls back.
-5. A eventually finishes and commits.
-6. **B has never modified any child rows.** B's transaction rolled back before it could do anything.
-
-**Case A's connection drops:**
-4. PostgreSQL detects the broken connection → A's transaction rolls back automatically.
-5. All of A's child-row mutations are undone.
-6. Row lock released.
-7. B's UPDATE proceeds. Session is back to PROCESSING (or previous RECONCILING) with stale heartbeat → B's claim succeeds.
-8. B runs the full algorithm from scratch on the original (pre-A) child-row state.
-
-**In all cases, at most one reconciler's child-row mutations are committed.**
-
-### §10.5. Interaction with concurrent registration (FOR SHARE)
-
-If a late `register_student()` T2 is in-flight when reconciliation starts:
-
-- T2 holds FOR SHARE on the session row.
-- Reconciliation's claim UPDATE needs an exclusive lock.
-- Exclusive lock is incompatible with FOR SHARE → reconciliation blocks.
-- T2 commits (student + audit) → FOR SHARE released.
-- Reconciliation proceeds. The audit record from T2 is now visible.
-- Reconciliation correctly classifies the row as SUCCEEDED.
-
-If reconciliation claims first (exclusive lock acquired) and T2 tries FOR SHARE:
-
-- T2 blocks until reconciliation commits.
-- After commit, session is terminal → T2's FOR SHARE reads terminal status → `BulkImportSessionFencedError` → T2 rolls back → no student.
+Both cannot commit child mutations for the same session. ✓
 
 ---
 
 ## §11. Outcome Semantics and Count Invariants
 
-### §11.1. Outcome definitions
+### §11.1. Outcome definitions (correction 5)
 
 | Outcome | Meaning | `was_attempted` | Student created? |
 |---|---|---|---|
-| SUCCEEDED | Audit record confirms student was created and committed. | TRUE | Yes |
-| FAILED | Registration was invoked, raised a known business error, the error was durably recorded, and no student was created. | TRUE | No |
-| NOT_PROCESSED | No durable evidence that a student was created for this row. Set by after-loop for rows never started (no child row). Set by reconciliation for STARTED rows with no audit record. The import function may or may not have been invoked — the system cannot determine this. | FALSE (never started) or NULL (indeterminate) | No |
-| OUTCOME_UNCERTAIN | Registration was invoked but an unexpected error occurred. The outcome has not yet been resolved. Set only by the import loop. Resolved by reconciliation to SUCCEEDED or NOT_PROCESSED. | TRUE | Unknown until resolved |
+| SUCCEEDED | Audit record confirms student created and committed. | TRUE | Yes |
+| FAILED | Registration invoked, known business error, rolled back. Error details durably recorded. | TRUE | No |
+| NOT_PROCESSED | **No committed registration was found for this row.** This does NOT necessarily mean registration was never attempted — it means no durable evidence of a committed student exists. | FALSE, TRUE, or NULL (see §11.2) | No |
+| OUTCOME_UNCERTAIN | Registration invoked, unexpected error. Not yet resolved. | TRUE | Unknown |
 | SKIPPED_PREVIEW_INVALID | Failed preview validation. Never attempted. | — (not in child table) | No |
 
-**Honest classification of lost failure details (correction 1 scenario):**
+### §11.2. `was_attempted` × status combinations
 
-1. T1 commits STARTED.
-2. T2 commits student + audit.
-3. Connection lost before T3.
-4. persist_uncertain() fails (no connection).
-5. Importer enters INTERRUPTED.
-6. After-loop: finds STARTED child row for this index → **leaves it untouched** (never reclassifies STARTED).
-7. After-loop: `unresolved_count > 0` → no terminal write → session stays PROCESSING.
-8. Reconciliation: reads STARTED child row + finds audit record → classifies as SUCCEEDED (`was_attempted = TRUE`).
+| Status | `was_attempted` | Scenario |
+|---|---|---|
+| SUCCEEDED | TRUE | T2 committed; audit proves it |
+| FAILED | TRUE | T2 invoked; business error |
+| NOT_PROCESSED | FALSE | Never started (after-loop: no child row); reconciliation: no child + no audit |
+| NOT_PROCESSED | TRUE | Was OUTCOME_UNCERTAIN (import loop knew T2 was invoked); reconciliation resolved: no audit → NOT_PROCESSED. Invocation known, but no committed student. |
+| NOT_PROCESSED | NULL | Was STARTED; reconciliation resolved: no audit. Whether T2 was invoked is indeterminate. |
+| OUTCOME_UNCERTAIN | TRUE | Pending resolution by reconciliation |
 
-The student is correctly accounted for. No false NOT_PROCESSED.
-
-**Contrast with the dangerous v6 behavior:** v6's after-loop would have converted STARTED → NOT_PROCESSED in step 6, producing a false result while the student was actually registered. v7 prevents this.
-
-**Case where T2 rolled back (business error) but T3 was never reached:**
-
-1. T1 commits STARTED.
-2. T2 rolls back (e.g., email conflict). Error details are in memory only.
-3. Connection lost before T3.
-4. Importer enters INTERRUPTED.
-5. After-loop: finds STARTED child row → leaves it untouched.
-6. Reconciliation: STARTED + no audit → NOT_PROCESSED (`was_attempted = NULL`).
-
-The error details are irrecoverable (they existed only in the exception object, never committed). `was_attempted = NULL` is honest: the system cannot prove whether the registration function was invoked. The admin re-uploads this row.
-
-### §11.2. RowOutcome → counter mapping
-
-| RowOutcome | Counter field |
-|---|---|
-| SUCCEEDED | `imported_count` |
-| FAILED | `failed_count` |
-| NOT_PROCESSED | `not_processed_count` |
-| OUTCOME_UNCERTAIN | `uncertain_count` |
-| SKIPPED_PREVIEW_INVALID | `invalid_count` (from preview; not in child table) |
+**API display per `was_attempted`:**
+- `true`: "Registration was invoked for this record."
+- `false`: "Registration was not invoked for this record."
+- `null` (displayed as `null` in JSON, empty in CSV): "Whether registration was invoked cannot be determined."
 
 ### §11.3. Database-enforced invariants
 
-**`ck_bulk_sessions_preview_counts`:** `total_rows = valid_count + invalid_count` (always).
-
-**`ck_bulk_sessions_import_counts`:**
-- Terminal states: `imported + failed + not_processed = valid_count AND uncertain = 0`.
-- Non-terminal states: `imported + failed + not_processed + uncertain ≤ valid_count`.
-
-**`uq_row_results_session_index`:** At most one child row per `(session, valid_row_index)`.
+Same as v7: `ck_bulk_sessions_preview_counts`, `ck_bulk_sessions_import_counts` (terminal: `sum = valid_count AND uncertain = 0`; non-terminal: `sum ≤ valid_count`), `uq_row_results_session_index`.
 
 ### §11.4. Application-enforced invariants
 
-Before writing terminal status (after-loop step 4b), the import loop verifies:
+After-loop (§9.3 step 4b): verify `succeeded + failed + not_processed == valid_count` before terminal write.
 
-1. `unresolved_count == 0` (no STARTED or OUTCOME_UNCERTAIN child rows).
-2. `definitive_count == valid_count` (every index has a definitive child row).
-
-If either check fails, terminal status is NOT written. Session stays PROCESSING.
-
-### §11.5. Reconciliation-enforced invariants
-
-After classifying all rows (step 6), reconciliation verifies:
-
-1. Total child rows = valid_count.
-2. No STARTED or OUTCOME_UNCERTAIN child rows remain.
-
-Then recalculates counters from child table and writes terminal status. The CHECK constraint validates on write.
+Reconciliation (§10.5 step 7): verify `total == valid_count` and no unresolved rows.
 
 ---
 
-## §12. API Contracts and HTTP Semantics
+## §12. API Contracts
 
-### §12.1. Upload CSV — `POST /admin/bulk-uploads`
+### §12.1. Upload — `POST /admin/bulk-uploads`
 
-**Permission:** `student.bulk_import`
-
-**Request:** `multipart/form-data` — `file` (≤ 5,000,000 bytes), `department_id` (UUID).
-
-**File acceptance:** Content-based (§5.1). Strict CSV parsing (§5.9).
-
-**Response 201:**
-```json
-{
-  "upload_id": "uuid",
-  "status": "PENDING_CONFIRMATION",
-  "file_name": "students.csv",
-  "file_size_bytes": 12345,
-  "total_rows": 95,
-  "valid_count": 90,
-  "invalid_count": 5,
-  "file_warnings": [],
-  "preview": {
-    "valid_rows": [
-      {
-        "valid_row_index": 1,
-        "csv_record_number": 1,
-        "first_name": "Ahmad", "last_name": "Khan",
-        "email": "ahmad@example.com", "roll_number": "CS-2024-001",
-        "program_code": "BSCS", "semester_level": 1,
-        "admission_term": "Fall 2026", "section_name": "A",
-        "phone": "+923001234567", "address": "123 Main St"
-      }
-    ],
-    "invalid_rows": [
-      {
-        "csv_record_number": 7,
-        "parsed_fields": {"first_name": "Sara"},
-        "errors": [{"field": "email", "code": "REQUIRED", "message": "Email is required."}]
-      }
-    ]
-  },
-  "expires_at": "2026-11-24T13:30:00Z"
-}
-```
-
-**Errors:** 400 (bad structure/headers/column-count mismatch/row count), 409 (zero valid rows), 413 (> 5 MB), 422 (not UTF-8, malformed CSV, field too large).
+Permission: `student.bulk_import`. Request: `multipart/form-data` — `file` (≤5 MB), `department_id`. Response 201: upload_id, status, counts, preview (valid + invalid rows), expires_at. Errors: 400, 409 (zero valid), 413, 422.
 
 ### §12.2. Confirm — `POST /admin/bulk-uploads/{id}/confirm`
 
-**Response 200** (processing is synchronous — complete before response):
+Response 200. If all rows resolved: terminal status + results. If unresolved: `status: "PROCESSING"`, `needs_reconciliation: true`. Errors: 404, 409.
 
-**If all rows resolved (normal completion):**
-```json
-{
-  "upload_id": "uuid",
-  "status": "COMPLETED",
-  "total_rows": 95, "valid_count": 90, "invalid_count": 5,
-  "imported_count": 85, "failed_count": 5,
-  "not_processed_count": 0, "uncertain_count": 0,
-  "results": [ ... ],
-  "preview_invalid_results": [ ... ],
-  "completed_at": "...",
-  "was_reconciled": false
-}
-```
+### §12.3. Get Status — `GET /admin/bulk-uploads/{id}`
 
-**If unresolved rows remain (interrupted, needs reconciliation):**
-```json
-{
-  "upload_id": "uuid",
-  "status": "PROCESSING",
-  "total_rows": 95, "valid_count": 90,
-  "imported_count": 45, "failed_count": 3,
-  "not_processed_count": 41, "uncertain_count": 1,
-  "last_started_valid_index": 50,
-  "needs_reconciliation": true,
-  "message": "Import interrupted. Trigger reconciliation to resolve uncertain outcomes."
-}
-```
+**Observable states in response:** PENDING_CONFIRMATION, EXPIRED, PROCESSING, COMPLETED, PARTIALLY_COMPLETED, FAILED. **Never RECONCILING** — if reconciliation is in progress, the concurrent read sees the last committed state: PROCESSING. The response includes `is_stale` and `needs_reconciliation` for PROCESSING sessions.
 
-**Errors:** 404, 409 (expired/already confirmed).
-
-### §12.3. Get Status / Results — `GET /admin/bulk-uploads/{id}`
-
-**PENDING_CONFIRMATION:** Full preview (email, phone, address visible). Includes `expires_at`.
-
-**EXPIRED:** Stub — counters, `preview_invalid_results`, dates. No `validated_rows`.
-
-**PROCESSING / RECONCILING:** Live counters (from parent table), `last_started_valid_index`, `is_stale` boolean, `needs_reconciliation` (true if `uncertain_count > 0` or stale). No per-row PII.
-
-**Terminal:** Row results from child table (first_name, last_name, roll_number, status, student_id, error info) + `preview_invalid_results`. No email/phone/address. `was_reconciled` from stored column. `was_attempted` per row.
+PENDING_CONFIRMATION: full preview. EXPIRED: stub. PROCESSING: live counters, `is_stale`, `needs_reconciliation`. Terminal: child-table results (first_name, last_name, roll_number, `was_attempted`, status, student_id, error info) + `preview_invalid_results`. No email/phone/address.
 
 ### §12.4. Reconcile — `POST /admin/bulk-uploads/{id}/reconcile`
 
-**Response 200:** Terminal results with recalculated counts and `was_reconciled: true`.
-
-**Errors:** 409 (not eligible — session not stale PROCESSING/RECONCILING), 503 (lock timeout).
+Response 200: terminal results. Response 409 with `contradictions` array: reconciliation detected data integrity issues, rolled back (§10.4). Session stays PROCESSING. Response 409 (not eligible): session not stale PROCESSING. Response 503: lock timeout.
 
 ### §12.5. Report — `GET /admin/bulk-uploads/{id}/report`
 
-**Response 200:** `text/csv; charset=utf-8`.
-
-Columns: `csv_record_number`, `valid_row_index`, `first_name`, `last_name`, `roll_number`, `status`, `was_attempted`, `error_code`, `error_message`, `corrective_action`, `is_retryable`.
-
-Includes all rows: child-table results (SUCCEEDED/FAILED/NOT_PROCESSED) + preview-invalid rows (SKIPPED_PREVIEW_INVALID from `preview_invalid_results`, with `valid_row_index` = empty, `was_attempted` = empty).
-
-**Formula injection on export:** Every cell checked. First character in `{= + - @ \t \r \n}` OR first non-whitespace in `{= + - @}` → prefix with `'`.
-
-Terminal states only. 409 for others.
+`text/csv; charset=utf-8`. Columns: `csv_record_number`, `valid_row_index`, `first_name`, `last_name`, `roll_number`, `status`, `was_attempted`, `error_code`, `error_message`, `corrective_action`, `is_retryable`. Includes child-table rows + preview-invalid rows (SKIPPED_PREVIEW_INVALID). Formula injection: prefix cells starting with `{= + - @ \t \r \n}`. Terminal only; 409 otherwise.
 
 ### §12.6. List — `GET /admin/bulk-uploads`
 
-Paginated. Filters: `department_id`, `status`. Shows summary counters, no per-row data.
+Paginated. Filters: `department_id`, `status`. Summary counters only.
 
 ---
 
-## §13. Privacy, Scrubbing, and Retention
+## §13. Privacy, Retention, and Purge Policy (correction 6)
 
 ### §13.1. Data classification
 
-| Location | PII content | Scrubbing |
+| Location | PII | Scrubbing |
 |---|---|---|
-| `validated_rows` (parent) | YES: all parsed fields | Scrubbed to `'[]'` atomically with terminal write |
+| `validated_rows` (parent) | YES: all parsed fields | Scrubbed to `[]` atomically with terminal write |
 | `preview_invalid_results` (parent) | NONE: record numbers + error codes | Never scrubbed |
-| Child table: `first_name`, `last_name`, `roll_number` | LIMITED: names + roll number | Retained until session purge |
-| Child table: all other columns | NONE | Retained |
-| Audit logs | Roll number, program, term (no email/phone/address) | Append-only, never scrubbed |
+| Child: `first_name`, `last_name`, `roll_number` | YES: names + roll number | Retained until purge |
+| Child: other columns | NONE | Retained until purge |
+| Audit logs | Roll number, program, term (no email/phone/address) | Append-only; retained indefinitely |
 
-### §13.2. Scrubbing atomicity
+### §13.2. Current implementation: indefinite retention
 
-`validated_rows = '[]'` is set in the same UPDATE that writes terminal status. If the UPDATE commits, PII is gone. If it rolls back, the session is not terminal.
+No purge mechanism exists in the current implementation. All bulk upload sessions, child rows, and audit records are retained indefinitely. **This is explicitly accepted as temporary** pending implementation of a purge mechanism in a future phase.
 
-### §13.3. Retention (pending approval — §17)
+### §13.3. Proposed retention (pending approval — N11)
 
-| State | Proposed retention | From |
+| State | Proposed retention | Measured from |
 |---|---|---|
-| Terminal | 90 days | `completed_at` |
+| Terminal (COMPLETED, PARTIALLY_COMPLETED, FAILED) | 90 days | `completed_at` |
 | EXPIRED | 30 days | `expires_at` |
 
-Purging deferred to future phase.
+### §13.4. Future purge specification
+
+When implemented, the purge operation must:
+
+1. **Delete child rows first** (`bulk_upload_row_results`). The FK `ON DELETE RESTRICT` from child to parent prevents deleting the parent while children exist.
+2. **Then delete parent** (`bulk_upload_sessions`).
+3. **Audit records are NOT deleted.** The `audit_logs` table is append-only (trigger blocks UPDATE/DELETE; runtime role has SELECT+INSERT only). Audit records referencing purged sessions remain as historical evidence. The `entity_id` (session UUID) becomes a dangling reference, which is acceptable for audit history.
+4. **PII in child rows** (`first_name`, `last_name`, `roll_number`) is removed by deleting the rows entirely. No selective scrubbing.
+5. **Stale PROCESSING sessions** (import crashed, never reconciled, heartbeat far older than 90 days): included in the purge scope. These are effectively abandoned sessions with no terminal resolution.
+6. **PENDING_CONFIRMATION sessions** past expiry + 30 days: `validated_rows` was already scrubbed to `[]` by lazy expiry. The session and any child rows (should be zero) are deleted.
+
+The purge runs as a maintenance task (migration role, not application role), since the application role has no DELETE grants on these tables.
 
 ---
 
 ## §14. Audit Behavior
 
-### §14.1. New audit actions
+### §14.1. Actions and entity type
 
 | Action | Value | Trigger |
 |---|---|---|
-| `BULK_IMPORT_UPLOADED` | `"bulk_import.uploaded"` | CSV parsed, session created |
-| `BULK_IMPORT_CONFIRMED` | `"bulk_import.confirmed"` | Session claimed for processing |
-| `BULK_IMPORT_COMPLETED` | `"bulk_import.completed"` | Terminal status written by import loop |
-| `BULK_IMPORT_INTERRUPTED` | `"bulk_import.interrupted"` | Import loop stopped with unresolved rows; session remains PROCESSING |
-| `BULK_IMPORT_RECONCILED` | `"bulk_import.reconciled"` | Reconciliation writes terminal status |
+| `BULK_IMPORT_UPLOADED` | `"bulk_import.uploaded"` | Session created |
+| `BULK_IMPORT_CONFIRMED` | `"bulk_import.confirmed"` | Confirmation claim |
+| `BULK_IMPORT_COMPLETED` | `"bulk_import.completed"` | Terminal write by after-loop |
+| `BULK_IMPORT_INTERRUPTED` | `"bulk_import.interrupted"` | After-loop: unresolved rows remain; session stays PROCESSING |
+| `BULK_IMPORT_RECONCILED` | `"bulk_import.reconciled"` | Reconciliation terminal write |
 
-New entity type: `BULK_UPLOAD_SESSION` = `"bulk_upload_session"`.
+Entity type: `BULK_UPLOAD_SESSION` = `"bulk_upload_session"`.
 
-### §14.2. `bulk_import.interrupted` — transaction and duplication rules (correction 4)
+`bulk_import.interrupted` and `bulk_import.completed` are mutually exclusive per session. A session that was interrupted and later reconciled has both `interrupted` and `reconciled` audit events.
 
-**Transaction boundary:** The interrupted event is committed in the after-loop transaction (§9.4 step 4a). This transaction also inserts NOT_PROCESSED child rows for never-started indexes and updates counters. The session remains PROCESSING — no terminal status is written in this transaction.
+### §14.2. Per-registration audit extension
 
-**If this transaction fails:** The interrupted event is not recorded. The session stays PROCESSING with stale heartbeat. Reconciliation resolves everything and writes `bulk_import.reconciled` instead. The absence of an interrupted event is acceptable; the reconciled event covers the full story.
-
-**Duplication prevention:** In the synchronous model, the confirm endpoint calls the import loop exactly once. At most one `bulk_import.interrupted` event per session. The import loop is never re-entered for the same session (the confirm endpoint rejects sessions not in PENDING_CONFIRMATION).
-
-**Relationship to `bulk_import.completed`:** These are mutually exclusive for a given session:
-- `interrupted` is written when unresolved rows remain (no terminal write).
-- `completed` is written when all rows have definitive outcomes (terminal write).
-A session that received `interrupted` and was later reconciled will also have `bulk_import.reconciled`.
-
-### §14.3. Per-registration audit extension
-
-When `bulk_origin` is provided, two keys are added to the `STUDENT_REGISTERED` metadata:
+When `bulk_origin` is provided:
 
 ```python
 metadata["bulk_upload_session_id"] = str(bulk_origin.upload_session_id)
-metadata["bulk_upload_row_number"] = bulk_origin.row_index
+metadata["bulk_upload_valid_row_index"] = bulk_origin.row_index
 ```
 
-Explicit string-literal keys. No `.update()` from arbitrary dict. `BulkImportOrigin` is frozen with exactly two fields.
+**Renamed from v7's `bulk_upload_row_number`** (correction A1). The key name now accurately describes what it stores: the `valid_row_index`, not the CSV record number.
 
-**Note:** The audit key is `bulk_upload_row_number` and stores the `valid_row_index` (not the csv_record_number). This is the stable identifier used for reconciliation queries.
-
-### §14.4. Reconciliation audit query
+### §14.3. Reconciliation query
 
 ```sql
 SELECT entity_id,
-       (event_metadata->>'bulk_upload_row_number')::integer AS row_index
+       event_metadata->>'bulk_upload_valid_row_index' AS raw_index
 FROM audit_logs
 WHERE action = 'student.registered'
   AND event_metadata->>'bulk_upload_session_id' = :upload_id_text;
 ```
 
-Uses `ix_audit_logs_action` index on the `action` column. No GIN index on `event_metadata` is required; the action index narrows the scan sufficiently for ≤100 rows per session.
+Uses `ix_audit_logs_action` index on `action`.
+
+### §14.4. Proposed: targeted partial index (pending approval — N7)
+
+```sql
+CREATE INDEX ix_audit_logs_bulk_session_id
+ON audit_logs ((event_metadata->>'bulk_upload_session_id'))
+WHERE action = 'student.registered'
+  AND event_metadata ? 'bulk_upload_session_id';
+```
+
+This partial index covers only bulk-import-related student.registered records. Improves reconciliation query performance as the audit table grows. The existing `ix_audit_logs_action` index is sufficient for correctness but requires a post-filter on JSONB for each `student.registered` row.
 
 ---
 
-## §15. M1–M4 Implementation Plan
+## §15. Crash-Window Analysis
 
-### M1 — Schema, Upload, Preview (3–4 days)
-
-1. `bulk_models.py`: `BulkUploadSession` and `BulkUploadRowResult` models with all constraints.
-2. `bulk_constants.py`: `BulkUploadStatus`, `RowOutcome`, `ImporterState`, `T1Result`, `T3Result`, file/stale constants.
-3. Alembic migration: both tables with constraints and indexes.
-4. `provision_db_roles.py`: both tables in `NO_DELETE_TABLES` and `COLUMN_UPDATE_TABLES`.
-5. `bulk_service.py`: `upload_csv()` — strict CSV parsing (`strict=True`, `field_size_limit(8192)`), UTF-8+BOM, header validation, column-count consistency, blank-row skipping, column-aware formula check (phone exempt), field validation using Phase 4 validators, program-duration semester check, reference resolution, `csv_record_number` and `valid_row_index` assignment, `preview_invalid_results` creation, `expires_at` calculation.
-6. `bulk_schemas.py`: upload request/response.
-7. `bulk_router.py`: `POST /admin/bulk-uploads`.
-8. `BulkImportOrigin`, `BulkImportSessionFencedError` definitions.
-9. Audit action/entity additions.
-10. Tests: upload, headers, formula (all triggers + phone exemption + E.164), semester-level against program duration, >100 records, >5 MB, zero valid, BOM, permissions, strict parsing (malformed quotes, field too large, inconsistent columns, blank rows, multi-line records).
-
-### M2 — Confirm, Import Loop, Fencing (3–4 days)
-
-1. Add `bulk_origin` parameter to `register_student()`.
-2. FOR SHARE fencing + `BulkImportSessionFencedError`.
-3. `bulk_service.py`: `confirm_and_process()` — claim, T1 with ON CONFLICT DO NOTHING (§7.1), T2 via register_student, T3 with consistency verification (§7.3), `ImporterState`, exception handlers, full after-loop algorithm (§9.4), interrupted audit event.
-4. `bulk_router.py`: `POST /admin/bulk-uploads/{id}/confirm` returning 200.
-5. Lazy expiry.
-6. Tests: confirm, partial success, all-fail, all-succeed, fencing (FOR SHARE blocks UPDATE), `BulkImportSessionFencedError` stops loop, fenced importer writes nothing, T1 ON CONFLICT (existing STARTED/terminal → skip), T3 zero-row child UPDATE (verify consistency check), session-broken recovery, interrupted-with-STARTED stays PROCESSING (correction 1 scenario), after-loop never reclassifies STARTED.
-
-### M3 — Reconciliation, Results, Report (2–3 days)
-
-1. `bulk_service.py`: `reconcile()` — single-transaction model (§10), claim with token, audit query, child-row classification, ownership-fenced terminal write, `was_reconciled = TRUE`.
-2. All remaining endpoints: reconcile, GET status/results, report (CSV), list.
-3. Per-state response shaping with privacy rules.
-4. `was_attempted` correctly set per classification rules (§4.3).
-5. Tests: reconciliation, stale detection, single-transaction ownership (§10.4 scenarios), lock timeout, results per state, `preview_invalid_results` in terminal, formula safety on report, `was_reconciled` accuracy, `was_attempted` values per scenario.
-
-### M4 — Integration and Edge Cases (2 days)
-
-1. End-to-end: upload → preview → confirm → results → report.
-2. Concurrency: fencing under concurrent registration + reconciliation.
-3. Failure injection: DB disconnect mid-import, crash between T2 and T3, reconciliation after crash.
-4. Count invariants: equality at terminal, inequality during processing, CHECK rejects bad writes.
-5. Child-table uniqueness: duplicate `valid_row_index` → ON CONFLICT DO NOTHING (not IntegrityError).
-6. Lazy expiry: fetch/confirm after expiry.
-7. Idempotency: reconciliation twice (second attempt → 409, session already terminal).
-8. Formula + phone: `+923001234567` accepted in phone, `+cmd` rejected in first_name.
-9. Semester: validates against program duration, not arbitrary cap.
-10. Correction 1 scenario: T1→T2 commit→crash before T3→STARTED remains→reconcile→SUCCEEDED.
+| # | Crash point | Child state | Audit? | Counter? | Recovery |
+|---|---|---|---|---|---|
+| CW1 | Upload INSERT before COMMIT | — | No | — | No session. Client retries. |
+| CW2 | Upload committed | — | uploaded | — | Normal flow. |
+| CW3 | Confirm committed, before loop | — | confirmed | — | PROCESSING, stale → reconcile: all NOT_PROCESSED. |
+| CW4 | T1 committed, ACK lost | STARTED | No | heartbeat | INTERRUPTED → after-loop fails → reconcile: STARTED+no audit → NOT_PROCESSED. |
+| CW5 | After T1, before T2 | STARTED | No | heartbeat | Same as CW4. |
+| CW6 | During T2, before COMMIT | STARTED | No | from T1 | T2 rolls back. Same as CW5. |
+| CW7 | T2 COMMIT sent, ACK lost | STARTED | Maybe | from T1 | Reconcile: if audit → SUCCEEDED; else → NOT_PROCESSED (was_attempted=NULL). |
+| CW8 | After T2 success, before T3 | STARTED | Yes | from T1 | After-loop leaves STARTED → reconcile: audit → SUCCEEDED. |
+| CW9 | After T2 rollback (error), before T3 | STARTED | No | from T1 | After-loop leaves STARTED → reconcile: no audit → NOT_PROCESSED (was_attempted=NULL). |
+| CW10 | T3 committed, ACK lost | Final | Matches | Updated | INTERRUPTED → after-loop: T1 for next row sees existing → SKIP. |
+| CW11 | After all rows, before after-loop | Per-row | Per-row | Per-row | After-loop runs. If fails → reconcile. |
+| CW12 | After-loop ownership UPDATE committed, crash before rest | Heartbeat refreshed | No new | No new | Session PROCESSING, heartbeat fresh. Wait for stale → reconcile. |
+| CW13 | After-loop committed | Children classified | Interrupted or completed | Recalculated | Terminal or PROCESSING with audit. |
+| CW14 | Terminal COMMIT sent, ACK lost | All final | All present | All counted | If committed: terminal. If not: PROCESSING → reconcile. |
 
 ---
 
 ## §16. Comprehensive Test Plan
 
-### §16.1. Crash-window tests (every transaction boundary from §7.5)
-
-| # | Boundary | What committed | What didn't | Recovery path | Assertion |
-|---|---|---|---|---|---|
-| CW1 | Upload INSERT before COMMIT | Nothing | Session | Client retries | No session in DB |
-| CW3 | Confirm UPDATE committed, crash before loop | PROCESSING + confirmed audit | — | Reconcile: 0 processed | All rows NOT_PROCESSED |
-| CW4 | T1 committed, ACK lost | STARTED child + heartbeat | — | INTERRUPTED → after-loop fails → reconcile | STARTED + no audit → NOT_PROCESSED |
-| CW5 | After T1, before T2 | STARTED child + heartbeat | Registration | After-loop leaves STARTED → reconcile | NOT_PROCESSED |
-| CW7 | T2 COMMIT sent, ACK lost | STARTED child; maybe student+audit | T3 | After-loop leaves STARTED → reconcile | If audit: SUCCEEDED. Else: NOT_PROCESSED (was_attempted=NULL) |
-| CW8 | After T2 success, before T3 | STARTED child + student + audit | T3 outcome | After-loop leaves STARTED → reconcile | SUCCEEDED (was_attempted=TRUE) |
-| CW9 | After T2 rollback (error), before T3 | STARTED child; no student, no audit | T3 outcome | After-loop leaves STARTED → reconcile | NOT_PROCESSED (was_attempted=NULL) |
-| CW10 | T3 committed, ACK lost | Final child + counter | App knowledge | T1 for next row: ON CONFLICT → SKIP. Or INTERRUPTED → reconcile | Child status is authoritative |
-| CW13 | After-loop committed, ACK lost | Children classified + interrupted audit (if applicable) | Response | 500 to client. Status check shows state | Session PROCESSING or terminal |
-| CW14 | Terminal COMMIT sent, ACK lost | Maybe terminal + scrub + completed audit | App knowledge | If committed: terminal. Else: PROCESSING → reconcile | Either state is consistent |
-
-### §16.2. Correction 1: STARTED rows never prematurely classified
+### §16.1. After-loop ownership tests (correction 1)
 
 | # | Scenario | Expected |
 |---|---|---|
-| S1 | T1→T2 success→crash before T3→persist_uncertain fails | Child stays STARTED. After-loop sees STARTED → no terminal. Reconcile: audit exists → SUCCEEDED |
-| S2 | T1→T2 rollback→crash before T3 | Child stays STARTED. After-loop sees STARTED → no terminal. Reconcile: no audit → NOT_PROCESSED (was_attempted=NULL) |
-| S3 | 3 rows: row 1 SUCCEEDED (T3 done), row 2 STARTED (crash before T3), row 3 never started | After-loop: inserts NOT_PROCESSED for row 3. Leaves row 2 STARTED. unresolved_count=1. No terminal. Reconcile resolves row 2 |
-| S4 | All rows SUCCEEDED normally (NORMAL state) | After-loop: 0 unresolved → terminal write → COMPLETED |
-| S5 | 1 row OUTCOME_UNCERTAIN | After-loop: unresolved_count=1 → no terminal → reconcile |
+| AO1 | After-loop acquires lock → reconciliation tries claim → blocks → after-loop commits terminal → reconciliation sees terminal → 409 | After-loop wins. No conflicting child mutations. |
+| AO2 | After-loop acquires lock → reconciliation times out (10s) → 503 → after-loop commits | After-loop wins. Reconciliation retried later. |
+| AO3 | Reconciliation acquires lock → after-loop blocks → reconciliation commits terminal → after-loop sees `status ≠ 'PROCESSING'` → returns | Reconciliation wins. After-loop does nothing. |
+| AO4 | Reconciliation acquires lock → after-loop lock_timeout (5s) → after-loop fails → session stays PROCESSING → reconciliation commits | Reconciliation wins. |
+| AO5 | Reconciliation acquires lock → rolls back (contradiction) → after-loop unblocked → sees PROCESSING → proceeds | After-loop wins. Reconciliation's changes were rolled back. |
+| AO6 | After-loop inserts NOT_PROCESSED for 3 never-started rows + writes interrupted audit in one transaction → verify all committed atomically | Children + counters + audit all present or all absent. |
+| AO7 | After-loop ownership UPDATE returns 0 (session already terminal) → after-loop does nothing | No child mutations, no audit. |
 
-### §16.3. Correction 3: T1 ON CONFLICT behavior
+### §16.2. Contradiction tests (correction 2)
 
-| # | Existing child status | T1 result | T2 called? | Assertion |
+| # | Setup | Expected |
+|---|---|---|
+| CT1 | Child SUCCEEDED for index 3; no audit with index 3 | Contradiction C1. Reconciliation rolls back. 409 with contradictions. |
+| CT2 | Child FAILED for index 5; audit exists for index 5 | Contradiction C2. Rolls back. |
+| CT3 | Child NOT_PROCESSED for index 7; audit exists for index 7 | Contradiction C3. Rolls back. |
+| CT4 | Child SUCCEEDED (student_id=X) for index 2; audit entity_id=Y ≠ X | Contradiction C4. Rolls back. |
+| CT5 | Two audit records with same index 4 | Contradiction C5. Rolls back. |
+| CT6 | Audit with `bulk_upload_valid_row_index = "abc"` (not integer) | Contradiction C6. Rolls back. |
+| CT7 | Audit with `bulk_upload_valid_row_index` key missing | Contradiction C7. Rolls back. |
+| CT8 | No contradictions; 3 STARTED+audit + 2 STARTED+no audit | Resolves: 3 SUCCEEDED + 2 NOT_PROCESSED. Terminal. |
+| CT9 | After rollback, session reverts to PROCESSING | Verify status = PROCESSING, heartbeat unchanged, no child modifications persisted. |
+
+### §16.3. RECONCILING visibility tests (correction 3)
+
+| # | Scenario | Expected |
+|---|---|---|
+| RV1 | Reconciliation in progress → concurrent GET status | Returns PROCESSING (READ COMMITTED sees last committed value) |
+| RV2 | Reconciliation commits → GET status | Returns terminal (COMPLETED/PARTIALLY_COMPLETED/FAILED) |
+| RV3 | Reconciliation rolls back → GET status | Returns PROCESSING |
+| RV4 | List sessions during reconciliation | Session listed as PROCESSING |
+
+### §16.4. Exception boundary tests (correction 4)
+
+| # | Scenario | Expected |
+|---|---|---|
+| EB1 | T2 succeeds → T3 SUCCEEDED committed → `schedule_email` raises | Row SUCCEEDED. Email failure logged as warning. Loop continues to next row. |
+| EB2 | T2 succeeds → T3 SUCCEEDED committed → `schedule_email` succeeds | Row SUCCEEDED. Email queued. Loop continues. |
+| EB3 | T2 raises StudentConflictError → T3 FAILED committed | Row FAILED. Loop continues. |
+| EB4 | T2 raises unexpected Exception → T3 OUTCOME_UNCERTAIN | Row OUTCOME_UNCERTAIN. Loop breaks (INTERRUPTED). |
+| EB5 | T2 succeeds → T3 raises Exception (connection lost) | Row stays STARTED. Student IS registered. Loop breaks. Reconciliation: audit → SUCCEEDED. |
+| EB6 | T2 succeeds → T3 returns FENCED | Row stays STARTED (T3 rolled back). Student IS registered. Loop breaks (FENCED). Reconciliation: audit → SUCCEEDED. |
+| EB7 | T2 raises business error → T3 raises Exception | Row stays STARTED. No student. Loop breaks. Reconciliation: no audit → NOT_PROCESSED. |
+
+### §16.5. STARTED-row safety tests (from v7)
+
+| # | Scenario | Expected |
+|---|---|---|
+| S1 | T1→T2 success→crash before T3→persist_uncertain fails | Child stays STARTED. After-loop leaves STARTED. No terminal. Reconcile: audit → SUCCEEDED. |
+| S2 | T1→T2 rollback→crash before T3 | Child stays STARTED. No terminal. Reconcile: no audit → NOT_PROCESSED (was_attempted=NULL). |
+| S3 | 3 rows: row 1 SUCCEEDED, row 2 STARTED (crash), row 3 never started | After-loop: inserts NOT_PROCESSED for row 3. Leaves row 2 STARTED. No terminal. Reconcile resolves row 2. |
+
+### §16.6. T1 ON CONFLICT tests (from v7)
+
+| # | Existing | T1 result | T2? |
+|---|---|---|---|
+| OC1 | None | PROCEED | Yes |
+| OC2 | STARTED | SKIP | No |
+| OC3 | SUCCEEDED | SKIP | No |
+| OC4 | FAILED | SKIP | No |
+
+### §16.7. T3 consistency tests (from v7)
+
+| # | Child UPDATE rows | Existing | Intended | Result |
 |---|---|---|---|---|
-| OC1 | None (fresh) | PROCEED | Yes | New STARTED child row created |
-| OC2 | STARTED | SKIP | No | Existing row untouched. No registration |
-| OC3 | SUCCEEDED | SKIP | No | Existing row untouched. No duplicate student |
-| OC4 | FAILED | SKIP | No | Existing row untouched |
-| OC5 | OUTCOME_UNCERTAIN | SKIP | No | Existing row untouched |
-| OC6 | NOT_PROCESSED | SKIP | No | Existing row untouched |
+| TC1 | 1 | — | SUCCEEDED | OK |
+| TC2 | 0 | SUCCEEDED | SUCCEEDED | ALREADY_WRITTEN |
+| TC3 | 0 | FAILED | SUCCEEDED | INCONSISTENT |
+| TC4 | 0 | NULL | SUCCEEDED | INCONSISTENT |
 
-### §16.4. Correction 8: T3 consistency verification
-
-| # | Child UPDATE rows | Existing status | Intended outcome | Result |
-|---|---|---|---|---|
-| TC1 | 1 | — | SUCCEEDED | OK — normal path |
-| TC2 | 0 | SUCCEEDED | SUCCEEDED | ALREADY_WRITTEN — idempotent, counter not incremented |
-| TC3 | 0 | FAILED | SUCCEEDED | INCONSISTENT — log error, INTERRUPTED |
-| TC4 | 0 | NULL (missing) | SUCCEEDED | INCONSISTENT — log error, INTERRUPTED |
-| TC5 | 1 (session fencing) | — | SUCCEEDED | FENCED — child + parent both rolled back |
-
-### §16.5. Fencing tests
+### §16.8. Reconciliation ownership tests (from v7, expanded for child mutations)
 
 | # | Test | Expected |
 |---|---|---|
-| F1 | Registration FOR SHARE → reconciliation UPDATE waits → registration commits | Audit visible to reconciliation |
-| F2 | Reconciliation claims → registration FOR SHARE reads RECONCILING | `BulkImportSessionFencedError`, loop stops, no student |
-| F3 | T1 parent UPDATE returns 0 (session fenced) | `importer_state = FENCED`, break before T2 |
-| F4 | T3 parent UPDATE returns 0 (session fenced after T2 success) | ROLLBACK undoes child UPDATE too. `importer_state = FENCED`. Student IS registered (T2 committed). Reconciliation finds audit. |
-| F5 | Fenced importer does not write terminal status or audit | Verified: `if importer_state == FENCED: pass` |
+| R1 | A claims → exclusive lock → B claims → blocks → A commits → B sees terminal → 409 | B never modified children. |
+| R2 | A claims → B times out → A commits | B retries later; finds terminal; 409. |
+| R3 | A claims → A's connection drops → all A's child mutations rolled back → B claims → B starts fresh | B sees pre-A child state. Correct classifications. |
+| R4 | A updates 5 child rows → A's connection drops → B claims → verify those 5 rows are in original state | A's uncommitted mutations are gone. |
 
-### §16.6. Reconciliation ownership tests (correction 2 — including child-table mutations)
+### §16.9. Fencing tests (from v7)
 
 | # | Test | Expected |
 |---|---|---|
-| R1 | A claims → `token_A`. Single transaction. | RECONCILING, token = `token_A`, row locked |
-| R2 | B tries to claim while A holds lock | B blocks. If B times out (10s) → 503 |
-| R3 | A commits (session terminal) → B unblocked → B's UPDATE matches 0 rows | B returns 409. **B never modified any child rows.** |
-| R4 | A's connection drops mid-reconciliation → all A's changes rolled back | B's claim succeeds. B's child-row classifications are based on pre-A state. No residue from A's uncommitted work. |
-| R5 | A updates 5 child rows → A's connection drops → B claims → B re-classifies all rows | Verify: all 5 of A's child-row changes are rolled back. B sees original STARTED/UNCERTAIN states. B produces correct classifications. |
-| R6 | Two concurrent claims on the same session | One blocks; timeout → 503 or delayed success finding terminal → 409 |
+| F1 | Registration FOR SHARE → reconciliation blocks → registration commits | Audit visible to reconciliation. |
+| F2 | Reconciliation claims → registration FOR SHARE blocks → reconciliation commits terminal → registration sees terminal → fencing error | No student. |
+| F3 | After-loop holds lock → registration FOR SHARE blocks → after-loop commits → registration proceeds or raises | Depends on terminal write. |
+| F4 | T1 parent UPDATE returns 0 | FENCED, break before T2. |
+| F5 | T3 parent UPDATE returns 0 | ROLLBACK (child + parent). FENCED. |
 
-### §16.7. Count invariant tests
+### §16.10. `was_attempted` tests (from v7, corrected for OUTCOME_UNCERTAIN resolution)
 
-| # | Assertion |
-|---|---|
-| C1 | `total_rows = valid_count + invalid_count` always |
-| C2 | PROCESSING: `sum ≤ valid_count` |
-| C3 | Terminal: `imported + failed + not_processed = valid_count AND uncertain = 0` |
-| C4 | Write terminal with `uncertain > 0` → IntegrityError |
-| C5 | Write terminal with `sum ≠ valid_count` → IntegrityError |
-| C6 | Child table: `COUNT(*) WHERE session = S` = `valid_count` at terminal |
-| C7 | Child table: `COUNT(*) GROUP BY status` matches parent counters |
-
-### §16.8. `was_attempted` tests (correction 5)
-
-| # | Scenario | Expected `was_attempted` |
+| # | Scenario | `was_attempted` |
 |---|---|---|
 | WA1 | T3 SUCCEEDED | TRUE |
-| WA2 | T3 FAILED (business error) | TRUE |
+| WA2 | T3 FAILED | TRUE |
 | WA3 | T3 OUTCOME_UNCERTAIN | TRUE |
-| WA4 | After-loop NOT_PROCESSED (never started, no child row) | FALSE |
-| WA5 | Reconciliation: STARTED + audit exists → SUCCEEDED | TRUE |
+| WA4 | After-loop NOT_PROCESSED (never-started) | FALSE |
+| WA5 | Reconciliation: STARTED + audit → SUCCEEDED | TRUE |
 | WA6 | Reconciliation: STARTED + no audit → NOT_PROCESSED | NULL |
-| WA7 | Reconciliation: no child row + no audit → NOT_PROCESSED | FALSE |
-| WA8 | Reconciliation: no child row + audit exists → SUCCEEDED | TRUE |
-| WA9 | Reconciliation: OUTCOME_UNCERTAIN + audit → SUCCEEDED | TRUE |
-| WA10 | Reconciliation: OUTCOME_UNCERTAIN + no audit → NOT_PROCESSED | NULL |
+| WA7 | Reconciliation: no child + no audit → NOT_PROCESSED | FALSE |
+| WA8 | Reconciliation: no child + audit → SUCCEEDED | TRUE |
+| WA9 | Reconciliation: OUTCOME_UNCERTAIN + audit → SUCCEEDED | TRUE (kept) |
+| WA10 | Reconciliation: OUTCOME_UNCERTAIN + no audit → NOT_PROCESSED | TRUE (kept — invocation was known) |
 
-### §16.9. Formula + phone tests
+### §16.11. Count invariant, formula+phone, strict CSV, and permission tests
 
-| # | Column | Input | Expected |
-|---|---|---|---|
-| FP1 | phone | `+923001234567` | ACCEPTED |
-| FP2 | phone | `+12025551234` | ACCEPTED |
-| FP3 | phone | `03001234567` | ACCEPTED |
-| FP4 | phone | `+SUM(1,2)` | REJECTED by `normalize_phone()` |
-| FP5 | first_name | `=cmd` | REJECTED: FORMULA_CELL |
-| FP6 | first_name | `+cmd` | REJECTED: FORMULA_CELL |
-| FP7 | email | `  =test@x.com` | REJECTED: FORMULA_CELL (first non-whitespace `=`) |
-| FP8 | roll_number | `\t=cmd` | REJECTED: FORMULA_CELL |
-| FP9 | address | `-cmd` | REJECTED: FORMULA_CELL |
-| FP10 | first_name | `Ahmad` | ACCEPTED |
-| FP11 | report cell | `=SUM` | Prefixed: `'=SUM` |
+Preserved from v7 §16.5–§16.11 without changes.
 
-### §16.10. Strict CSV parsing tests (correction 7)
+---
 
-| # | Input | Expected |
-|---|---|---|
-| CSV1 | Valid 10-row file | 201 |
-| CSV2 | Malformed quote: `"unterm` | 422 (strict mode) |
-| CSV3 | Field > 8192 bytes | 422 (field_size_limit) |
-| CSV4 | Row with 6 fields, header has 7 | 400 (column-count mismatch, cites record number) |
-| CSV5 | Row with 8 fields, header has 7 | 400 (column-count mismatch) |
-| CSV6 | All-blank rows interspersed | Skipped; not counted |
-| CSV7 | Multi-line quoted field (`"line1\nline2"`) | Parsed as one record |
-| CSV8 | File with only header + blank rows | 400 (no data records) |
-| CSV9 | 101 non-blank records | 400 (exceeds 100) |
-| CSV10 | Exactly 100 non-blank records | 201 |
-| CSV11 | File with BOM | BOM stripped, parsed normally |
-| CSV12 | File is not UTF-8 (Latin-1) | 422 |
+## §17. M1–M4 Implementation Plan
 
-### §16.11. Permission tests
+### M1 — Schema, Upload, Preview (3–4 days)
 
-| Role | Upload | Confirm | Status | Reconcile | Report | List |
-|---|---|---|---|---|---|---|
-| Main Admin | 201 | 200 | 200 | 200 | 200 | 200 |
-| HOD | 403 | 403 | 403 | 403 | 403 | 403 |
-| Dept Staff | 403 | 403 | 403 | 403 | 403 | 403 |
-| Student | 403 | 403 | 403 | 403 | 403 | 403 |
-| Unauthed | 401 | 401 | 401 | 401 | 401 | 401 |
+1. `bulk_models.py`: `BulkUploadSession`, `BulkUploadRowResult` (with `student_id` FK).
+2. `bulk_constants.py`: enums, constants.
+3. Alembic migration: both tables, constraints, indexes. Optionally partial audit index (N7).
+4. `provision_db_roles.py`: `NO_DELETE_TABLES`, `COLUMN_UPDATE_TABLES`.
+5. `bulk_service.py`: `upload_csv()` — strict parsing (save/restore `field_size_limit`), all validations.
+6. `bulk_schemas.py`, `bulk_router.py`.
+7. `BulkImportOrigin`, `BulkImportSessionFencedError`.
+8. Audit additions.
+9. Tests: upload, headers, formula, semester, >100 records, >5 MB, zero valid, BOM, permissions, strict CSV.
+
+### M2 — Confirm, Import Loop, Fencing, After-Loop (3–4 days)
+
+1. `bulk_origin` parameter on `register_student()`. FOR SHARE fencing.
+2. `confirm_and_process()`: confirmation claim, import loop with separated try blocks (§9.2), after-loop with ownership (§9.3).
+3. `persist_started` (ON CONFLICT), `persist_outcome` (T3 with consistency check).
+4. `POST /admin/bulk-uploads/{id}/confirm`. Lazy expiry.
+5. Tests: confirm, partial success, fencing, T1 ON CONFLICT, T3 consistency, exception boundaries (EB1–EB7), after-loop ownership (AO1–AO7), STARTED safety (S1–S3), broken session/connection loss.
+
+### M3 — Reconciliation, Results, Report (2–3 days)
+
+1. `reconcile()`: single-transaction model (§10), contradiction detection, decision table, fail-closed rollback.
+2. Remaining endpoints: reconcile, GET, report (CSV), list.
+3. Per-state response shaping. RECONCILING never returned.
+4. Tests: reconciliation, contradictions (CT1–CT9), RECONCILING visibility (RV1–RV4), ownership races (R1–R4), `was_attempted` per scenario.
+
+### M4 — Integration and Edge Cases (2 days)
+
+1. End-to-end: upload → confirm → results → report.
+2. Concurrency: fencing, after-loop vs reconciliation.
+3. Failure injection: DB disconnect, crash between T2 and T3, reconciliation after crash.
+4. Count invariants. Child-table uniqueness. Idempotency.
+5. Correction 1 scenario: T1→T2 commit→crash→STARTED remains→reconcile→SUCCEEDED.
 
 ---
 
 ## §17. Decisions Awaiting User Approval
 
-None of the decisions below have been silently promoted to "approved."
+None promoted to approved.
 
-**From v4–v6 (still pending):**
+**From v4–v7 (still pending):**
 
-| # | Decision | Proposed value | Section |
-|---|----------|---------------|---------|
-| P1 | 5-minute stale PROCESSING heartbeat threshold | 5 min | §10 |
-| P2 | FOR SHARE fencing inside `register_student()` | As described | §8 |
-| P3 | `BulkImportOrigin` frozen dataclass | As described | §8, §14 |
-| P4 | `BulkImportSessionFencedError` exception | Extends `StudentServiceError` directly | §9 |
-| P5 | `reconciliation_claim_token UUID` (defense-in-depth) | As described | §10 |
-| P6 | `preview_invalid_results` JSONB (PII-free, never scrubbed) | As described | §4, §5 |
-| P7 | `expires_at TIMESTAMPTZ` with lazy expiry | As described | §4, §6 |
-| P8 | Column-aware formula validation (phone exempt) | As described | §5 |
-| P9 | Confirm returns HTTP 200 | As described | §12 |
-| P10 | `bulk_upload_row_results` child table with UNIQUE | As described | §4, §7 |
-| P11 | `valid_row_index` separate from record number | As described | §4, §5 |
-| P12 | Terminal enforces `uncertain_count = 0`; uncertain stays PROCESSING | As described | §3D, §11 |
-| P13 | `was_reconciled BOOLEAN NOT NULL DEFAULT FALSE` | As described | §4 |
-| P14 | 10-second reconciliation lock timeout | 10s | §10 |
-| P15 | 5-minute stale RECONCILING threshold | 5 min | §10 |
-| P16 | 90-day terminal session retention | 90 days | §13 |
-| P17 | 30-day expired session retention | 30 days | §13 |
-| P18 | Dedicated `uncertain_count` column | As described | §4 |
+| # | Decision | Section |
+|---|----------|---------|
+| P1 | 5-min stale PROCESSING heartbeat threshold | §6, §10 |
+| P2 | FOR SHARE fencing inside `register_student()` | §8 |
+| P3 | `BulkImportOrigin` frozen dataclass | §8, §14 |
+| P4 | `BulkImportSessionFencedError` extends `StudentServiceError` directly | §9 |
+| P5 | `reconciliation_claim_token UUID` (defense-in-depth) | §10 |
+| P6 | `preview_invalid_results` JSONB (PII-free, never scrubbed) | §4 |
+| P7 | `expires_at TIMESTAMPTZ` with lazy expiry | §4, §6 |
+| P8 | Column-aware formula validation (phone exempt) | §5 |
+| P9 | Confirm returns HTTP 200 | §12 |
+| P10 | `bulk_upload_row_results` child table with UNIQUE | §4 |
+| P11 | `valid_row_index` separate from `csv_record_number` | §4, §5 |
+| P12 | Terminal enforces `uncertain_count=0` | §3D |
+| P13 | `was_reconciled BOOLEAN NOT NULL DEFAULT FALSE` | §4 |
+| P14 | 10-second reconciliation lock timeout | §10 |
+| P15 | Dedicated `uncertain_count` column | §4 |
+| P16 | After-loop never reclassifies STARTED | §9 |
+| P17 | T1 `INSERT ON CONFLICT DO NOTHING` | §7 |
+| P18 | `was_attempted BOOLEAN` nullable | §4, §11 |
+| P19 | `csv_record_number` column name | §4, §5 |
+| P20 | Strict CSV parsing | §5 |
+| P21 | T3 consistency: verify on zero-row UPDATE | §7 |
 
-**New in v7:**
+**New in v8:**
 
-| # | Decision | Proposed value | Section |
-|---|----------|---------------|---------|
-| N1 | After-loop never reclassifies STARTED; inserts NOT_PROCESSED only for missing rows | As described | §9.4 |
-| N2 | Reconciliation single-transaction model (FOR UPDATE lock held throughout) | As described | §10 |
-| N3 | T1 uses `INSERT ON CONFLICT DO NOTHING RETURNING id`; conflict → skip | As described | §7.1 |
-| N4 | `bulk_import.interrupted` committed in after-loop transaction; session stays PROCESSING | As described | §14.2 |
-| N5 | `was_attempted BOOLEAN` nullable; NULL = indeterminate | As described | §4.3 |
-| N6 | `csv_record_number` column name | As described | §4.2, §5.3 |
-| N7 | Strict CSV parsing: `strict=True`, `field_size_limit(8192)`, column-count consistency | As described | §5 |
-| N8 | T3 consistency: verify existing child-row status on zero-row UPDATE | As described | §7.3 |
+| # | Decision | Section |
+|---|----------|---------|
+| N1 | After-loop exclusive lock via conditional heartbeat UPDATE with 5s `lock_timeout` | §9 |
+| N2 | Reconciliation rolls back on contradictions; session reverts to PROCESSING | §10 |
+| N3 | RECONCILING transient only; stale RECONCILING reclaim removed; claim checks only `status='PROCESSING'` | §3D, §10 |
+| N4 | Separate try blocks for T2, T3, email | §9 |
+| N5 | NOT_PROCESSED = "no committed registration found" | §11 |
+| N6 | Audit key renamed to `bulk_upload_valid_row_index` | §14 |
+| N7 | Proposed: partial audit index for reconciliation | §14 |
+| N8 | Proposed: child `student_id REFERENCES users(id) ON DELETE RESTRICT` | §4 |
+| N9 | `csv.field_size_limit` save/restore around parsing | §5 |
+| N10 | After-loop recalculates all counters from child table | §9 |
+| N11 | Proposed: 90-day terminal / 30-day expired retention (purge deferred) | §13 |
+| N12 | 5-min stale RECONCILING reclaim removed (meaningless under single-tx) | §3D |
 
 ---
 
-## §18. Verdict
+**READY FOR USER APPROVAL — DESIGN ONLY**
 
-**READY FOR USER APPROVAL.** No code has been created or modified. Awaiting explicit approval before M1 implementation.
-this is what claude give me..
+No code has been created or modified. Awaiting explicit approval before M1 implementation.
